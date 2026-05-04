@@ -135,6 +135,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./src:/opt/airflow/src
       - airflow_logs:/opt/airflow/logs
+      - ./data:/opt/airflow/data
     ports:
       - "8080:8080"
     networks:

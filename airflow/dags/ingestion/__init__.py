@@ -1,0 +1,3 @@
+# Airflow treats the dags/ folder as a Python path root.
+# This __init__.py makes `ingestion/` a package so the DAG file can import:
+#     from ingestion.tasks import setup_environment, fetch_daily_papers, ...
