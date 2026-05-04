@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from src.routers.documents import router as documents_router
+from src.routers.search import router as search_router
 import logging
 
 from src.services.database import create_tables
@@ -24,6 +25,7 @@ app = FastAPI(
 )
 
 app.include_router(documents_router)
+app.include_router(search_router)
 
 
 @app.get("/api/v1/health")
