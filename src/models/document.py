@@ -1,10 +1,12 @@
-from sqlalchemy import Column, String, Text, DateTime, JSON, Integer
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import Column, String, Text, DateTime, JSON
+from sqlalchemy.orm import declarative_base
 from datetime import datetime, timezone
 
-
-class Base(DeclarativeBase):
-    pass
+# declarative_base() is the SQLAlchemy 1.4-style base class factory.
+# It works in both 1.4 (used by the Airflow container) and 2.x (used by the
+# API container). The newer DeclarativeBase class syntax (2.0 only) would
+# crash inside Airflow because Airflow 3.0 pins SQLAlchemy to 1.4.
+Base = declarative_base()
 
 
 class Document(Base):

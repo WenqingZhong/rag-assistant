@@ -6,18 +6,23 @@ logger = logging.getLogger(__name__)
 
 class PDFParser:
     """
-    Converts a PDF file into structured text using Docling.
+    Converts a PDF file into plain text using pypdfium2 (Google PDFium).
 
-    Why Docling and not PyPDF2 or pdfplumber?
-    Academic PDFs (and legal documents) are NOT simple text files.
-    They have multi-column layouts, complex tables, footnotes,
-    mathematical notation, and headers/footers that break naive parsers.
-    PyPDF2 often returns garbled text for these. Docling is a purpose-built
-    ML-based parser that understands document structure.
+    WHY pypdfium2 instead of Docling?
+    Docling's StandardPdfPipeline loads a ~1-2 GB layout-analysis ML model.
+    In a Docker container on a laptop (typically 4-8 GB total RAM shared with
+    PostgreSQL, OpenSearch, and Airflow itself), that model consistently
+    triggers the OOM killer. pypdfium2 is a thin Python binding over PDFium
+    — Google's production PDF renderer — and extracts text in milliseconds
+    with negligible memory usage and no ML inference at all.
 
-    The tradeoff: Docling is slow (2-3 minutes per paper on CPU).
-    That's acceptable for a background pipeline but never for a live request.
-    This is why parsing happens in Airflow (scheduled, async) not in FastAPI.
+    The tradeoff: text ordering in complex multi-column layouts may be less
+    accurate than Docling's ML-based approach. For BM25 keyword search (the
+    current use case), clean extracted text is all that matters — layout
+    perfection is not required.
+
+    Docling can be re-enabled by swapping this class out once the deployment
+    environment has sufficient RAM (16+ GB available to the container).
     """
 
     def __init__(self):
@@ -25,76 +30,46 @@ class PDFParser:
 
     def parse(self, pdf_path: str) -> dict | None:
         """
-        Parse a PDF file into structured content.
+        Parse a PDF file into plain text.
 
-        Returns a dict with two keys:
-            {
-                "full_text": "entire document as markdown string",
-                "sections": [{"title": "Introduction", "content": "..."}, ...]
-            }
-        Returns None if parsing fails entirely.
+        Returns:
+            {"full_text": str, "sections": []} on success
+            None if the file cannot be read (corrupt, missing, etc.)
 
-        Why return a dict instead of a dataclass?
-        This gets stored directly as JSON in PostgreSQL (the 'sections' column),
-        so a plain dict is the most convenient form.
+        WHY return a dict instead of a dataclass?
+        Stored directly as JSON in PostgreSQL — plain dict is the most
+        convenient form for both SQLAlchemy and JSON serialisation.
         """
         try:
-            # WHY import inside the function instead of at the top of the file?
-            # Docling is a large ML library — importing it at module load time
-            # adds several seconds to startup even when you're not parsing anything.
-            # By importing lazily (only when parse() is actually called),
-            # the API server starts up fast and only pays the import cost
-            # when a parse job actually runs.
-            from docling.document_converter import DocumentConverter
+            # Lazy import: pypdfium2 is fast to import but we keep the pattern
+            # consistent — nothing at module level that delays the DAG processor.
+            import pypdfium2 as pdfium
 
             logger.info(f"Parsing PDF: {pdf_path}")
 
-            # DocumentConverter is Docling's main entry point.
-            # It auto-detects the file format and applies the right pipeline.
-            converter = DocumentConverter()
+            pdf = pdfium.PdfDocument(pdf_path)
+            num_pages = min(len(pdf), self.settings.max_pages)
 
-            # .convert() does the heavy lifting:
-            # - reads the PDF bytes
-            # - runs layout analysis (ML model)
-            # - identifies sections, tables, figures
-            # - extracts text in reading order
-            result = converter.convert(pdf_path)
+            page_texts = []
+            for i in range(num_pages):
+                page = pdf[i]
+                textpage = page.get_textpage()
+                text = textpage.get_text_range()
+                if text and text.strip():
+                    page_texts.append(text.strip())
 
-            # Export to markdown — this gives us clean, structured text
-            # where headers are "# Introduction", tables are markdown tables, etc.
-            # Much better than raw extracted text for LLM consumption later.
-            full_text = result.document.export_to_markdown()
+            full_text = "\n\n".join(page_texts)
 
-            # Attempt to extract section structure.
-            # This is wrapped in its own try/except because sections are
-            # OPTIONAL — if extraction fails, we still want the full_text.
-            # Better to have imperfect data than no data.
-            sections = []
-            try:
-                # iterate_items() walks the document tree node by node.
-                # Each item has a 'label' (e.g. "section_header", "paragraph", "table").
-                for item in result.document.iterate_items():
-                    if hasattr(item, 'label') and 'section' in str(item.label).lower():
-                        sections.append({
-                            "title": getattr(item, 'text', ''),
-                            "content": ""
-                            # Note: content is empty for now — we populate it
-                            # in Week 4 when we do proper chunking.
-                        })
-            except Exception:
-                # Silently skip section extraction failure.
-                pass
+            if not full_text:
+                logger.warning(f"No text extracted from {pdf_path} — may be image-only")
+                return None
 
             logger.info(
                 f"Successfully parsed PDF: {len(full_text)} chars, "
-                f"{len(sections)} sections"
+                f"{num_pages} pages"
             )
-            return {"full_text": full_text, "sections": sections}
+            return {"full_text": full_text, "sections": []}
 
         except Exception as e:
-            # Outer exception handler — if Docling itself crashes
-            # (malformed PDF, out of memory, unsupported format), we
-            # return None rather than crashing the whole pipeline.
-            # The orchestrator will mark this document as parse_status="failed".
             logger.error(f"Failed to parse PDF {pdf_path}: {e}")
             return None

@@ -1,7 +1,11 @@
-from fastapi import APIRouter, HTTPException
-from src.schemas.search import SearchRequest, SearchResponse
-from src.services.opensearch.indexing_service import search_bm25
 import logging
+
+from fastapi import APIRouter, HTTPException
+
+from src.config import get_settings
+from src.schemas.search import SearchRequest, SearchResponse
+from src.services.opensearch.client import OpenSearchClient
+from src.services.opensearch.indexing_service import search_bm25
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +16,7 @@ router = APIRouter(prefix="/api/v1/search", tags=["search"])
 def search(request: SearchRequest) -> SearchResponse:
     """
     BM25 keyword search across all indexed documents.
-    
+
     POST body example:
     {
         "query": "transformer attention mechanism",
@@ -20,6 +24,9 @@ def search(request: SearchRequest) -> SearchResponse:
         "source": "arxiv",
         "date_from": "2024-01-01"
     }
+
+    The call chain:
+        search_bm25() → OpenSearchClient.search_papers() → PaperQueryBuilder.build()
     """
     try:
         results = search_bm25(
@@ -37,13 +44,33 @@ def search(request: SearchRequest) -> SearchResponse:
 
 @router.get("/health")
 def search_health():
-    """Check if OpenSearch index exists and has documents."""
-    from src.services.opensearch.indexing_service import get_opensearch_client, INDEX_NAME
-    client = get_opensearch_client()
-    
-    try:
-        stats = client.indices.stats(index=INDEX_NAME)
-        doc_count = stats["_all"]["total"]["docs"]["count"]
-        return {"status": "healthy", "indexed_documents": doc_count}
-    except Exception as e:
-        return {"status": "unavailable", "error": str(e)}
+    """
+    Check OpenSearch availability and index statistics.
+
+    Returns document count, index size, and cluster health status.
+    Useful for operators to confirm the index is populated and healthy
+    before trusting search results.
+
+    Previously this called client.indices.stats() directly on the raw
+    opensearchpy client. Now it uses OpenSearchClient.get_index_stats()
+    which encapsulates that call and normalises the response shape.
+    """
+    settings = get_settings()
+    client = OpenSearchClient(host=settings.opensearch.host)
+
+    # health_check() tests the cluster, not just connectivity.
+    # Returns False if status is "red" (primary shards unassigned).
+    if not client.health_check():
+        return {"status": "unavailable", "error": "OpenSearch cluster is not healthy"}
+
+    stats = client.get_index_stats()
+
+    if "error" in stats:
+        return {"status": "unavailable", "error": stats["error"]}
+
+    return {
+        "status": "healthy",
+        "indexed_documents": stats["document_count"],
+        "index_size_bytes": stats["size_in_bytes"],
+        "cluster_health": stats["health"],
+    }

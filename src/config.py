@@ -11,7 +11,7 @@ class OpenSearchSettings(BaseSettings):
 
 class ArxivSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ARXIV__")
-    max_results: int = 15
+    max_results: int = 5
     base_url: str = "https://export.arxiv.org/api/query"
     pdf_cache_dir: str = "./data/arxiv_pdfs"
     rate_limit_delay: float = 3.0
@@ -27,7 +27,7 @@ class PDFParserSettings(BaseSettings):
     max_pages: int = 30
     max_file_size_mb: int = 20
     do_ocr: bool = False
-    do_table_structure: bool = True
+    do_table_structure: bool = False
 
 
 class Settings(BaseSettings):
