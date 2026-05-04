@@ -2,19 +2,27 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm AS base
 
 WORKDIR /app
 
-# Copy dependency files first (Docker caches this layer — faster rebuilds)
 COPY pyproject.toml uv.lock ./
 
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
-# Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# Copy source code
 COPY src /app/src
 
 FROM python:3.12.8-slim AS final
+
+RUN apt-get update && apt-get install -y \
+    libxcb1 \
+    libx11-6 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000
 ENV PYTHONUNBUFFERED=1

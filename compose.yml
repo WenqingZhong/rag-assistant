@@ -16,6 +16,12 @@ services:
       - OPENSEARCH__HOST=http://opensearch:9200
       - OLLAMA_HOST=http://ollama:11434
       - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - rag-network
 
@@ -26,6 +32,8 @@ services:
       - POSTGRES_DB=rag_db
       - POSTGRES_USER=rag_user
       - POSTGRES_PASSWORD=rag_password
+      - POSTGRES_HOST_AUTH_METHOD=password
+      - PGDATA=/var/lib/postgresql/data/pgdata
     ports:
       - "5432:5432"
     volumes:
@@ -35,6 +43,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 30s
+    restart: unless-stopped
     networks:
       - rag-network
 
@@ -45,8 +55,14 @@ services:
       - discovery.type=single-node
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
       - DISABLE_SECURITY_PLUGIN=true
+      - bootstrap.memory_lock=true
     ports:
       - "9200:9200"
+      - "9600:9600"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
       - opensearch_data:/usr/share/opensearch/data
     healthcheck:
@@ -55,6 +71,7 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    restart: unless-stopped
     networks:
       - rag-network
 
@@ -68,6 +85,12 @@ services:
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
     depends_on:
       - opensearch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     networks:
       - rag-network
 
@@ -78,6 +101,42 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - rag-network
+
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    container_name: rag-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - AIRFLOW_HOME=/opt/airflow
+      - PYTHONPATH=/opt/airflow/src
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
     networks:
       - rag-network
 
@@ -85,6 +144,7 @@ volumes:
   postgres_data:
   opensearch_data:
   ollama_data:
+  airflow_logs:
 
 networks:
   rag-network:
