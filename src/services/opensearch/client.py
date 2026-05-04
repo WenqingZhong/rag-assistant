@@ -194,7 +194,7 @@ class OpenSearchClient:
         calling index() per document is negligible. We gain simpler code and
         per-document error isolation: one bad document doesn't abort the whole batch.
 
-        If you were indexing millions of documents, switch to helpers.bulk() from
+        If we were indexing millions of documents, switch to helpers.bulk() from
         the opensearch-py helpers module for 10x+ throughput improvement.
 
         :returns: {"success": int, "failed": int}

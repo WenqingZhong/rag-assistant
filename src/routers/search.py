@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from src.config import get_settings
-from src.schemas.search import SearchRequest, SearchResponse
+from src.schemas.api.search import SearchRequest, SearchResponse
 from src.services.opensearch.client import OpenSearchClient
 from src.services.opensearch.indexing_service import search_bm25
 
@@ -50,10 +50,6 @@ def search_health():
     Returns document count, index size, and cluster health status.
     Useful for operators to confirm the index is populated and healthy
     before trusting search results.
-
-    Previously this called client.indices.stats() directly on the raw
-    opensearchpy client. Now it uses OpenSearchClient.get_index_stats()
-    which encapsulates that call and normalises the response shape.
     """
     settings = get_settings()
     client = OpenSearchClient(host=settings.opensearch.host)

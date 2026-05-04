@@ -23,7 +23,7 @@ def _get_client() -> OpenSearchClient:
     NOT a new TCP connection — opensearchpy pools connections internally.
     So this is safe and avoids startup-time connection errors.
 
-    In a high-traffic API you'd cache this in FastAPI's app.state and inject
+    In a high-traffic API we'd cache this in FastAPI's app.state and inject
     it via dependency injection. For our Airflow + low-RPS API workloads,
     per-call creation is perfectly fine.
     """
@@ -147,11 +147,6 @@ def search_bm25(
 ) -> dict:
     """
     Run a BM25 keyword search across all indexed documents.
-
-    This function's SIGNATURE is unchanged from before — the router calls
-    it with the same arguments it always did. Internally, it now delegates
-    to OpenSearchClient.search_papers(), which delegates query construction
-    to PaperQueryBuilder.
 
     The three-layer chain:
         search_bm25()           → business-level interface (this module)

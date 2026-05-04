@@ -33,11 +33,15 @@ class PDFParserSettings(BaseSettings):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    app_version: str = "0.1.0"
+    service_name: str = "rag-api"
     debug: bool = True
     environment: str = "development"
     postgres_database_url: str = "postgresql+psycopg2://rag_user:rag_password@localhost:5432/rag_db"
     opensearch_host: str = "http://localhost:9200"
     ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "llama3.2:1b"
+    ollama_timeout: int = 300
 
     opensearch: OpenSearchSettings = Field(default_factory=OpenSearchSettings)
     arxiv: ArxivSettings = Field(default_factory=ArxivSettings)
