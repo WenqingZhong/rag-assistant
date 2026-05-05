@@ -6,9 +6,11 @@ from sqlalchemy import text
 
 from src.config import get_settings
 from src.routers.documents import router as documents_router
+from src.routers.hybrid_search import router as hybrid_search_router
 from src.routers.search import router as search_router
 from src.schemas.api.health import HealthResponse, ServiceStatus
 from src.services.database import create_tables, get_session
+from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.ollama import OllamaClient
 from src.services.opensearch.client import OpenSearchClient
 
@@ -18,9 +20,46 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up RAG Assistant API...")
+    settings = get_settings()
+
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
     create_tables()
+    logger.info("PostgreSQL tables ready")
+
+    # ── OpenSearch (hybrid chunks index) ─────────────────────────────────────
+    # A single OpenSearchClient instance handles both the existing arxiv-papers
+    # index (via search_papers) and the new arxiv-papers-chunks index (via
+    # bulk_index_chunks / search_unified). Stored under hybrid_opensearch_client
+    # so hybrid_search.py's dependency provider can find it without ambiguity.
+    hybrid_os_client = OpenSearchClient(host=settings.opensearch.host)
+    app.state.hybrid_opensearch_client = hybrid_os_client
+
+    if hybrid_os_client.health_check():
+        # Create arxiv-papers-chunks index and register the RRF pipeline if
+        # they don't exist yet. Idempotent — safe to call on every startup.
+        setup = hybrid_os_client.setup_hybrid_indices(force=False)
+        logger.info(
+            f"Hybrid index {'created' if setup['hybrid_index'] else 'already exists'}, "
+            f"RRF pipeline {'created' if setup['rrf_pipeline'] else 'already exists'}"
+        )
+    else:
+        logger.warning("OpenSearch unavailable at startup — hybrid search will return 503")
+
+    # ── Jina embeddings client ────────────────────────────────────────────────
+    # Stored in app.state so the persistent httpx connection pool is reused
+    # across all requests (one TLS handshake at startup, not per request).
+    # Closed gracefully on shutdown to drain in-flight connections.
+    jina_client = JinaEmbeddingsClient(api_key=settings.jina_api_key)
+    app.state.jina_client = jina_client
+    logger.info("Jina embeddings client ready")
+
+    logger.info("RAG Assistant API ready")
     yield
-    logger.info("Shutting down...")
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    await app.state.jina_client.close()
+    logger.info("Jina client connection pool closed")
+    logger.info("Shutting down complete")
 
 
 app = FastAPI(
@@ -32,6 +71,7 @@ app = FastAPI(
 
 app.include_router(documents_router)
 app.include_router(search_router)
+app.include_router(hybrid_search_router)
 
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["Health"])
