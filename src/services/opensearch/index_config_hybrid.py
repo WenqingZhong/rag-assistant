@@ -6,13 +6,35 @@ Two things are defined here:
     ARXIV_PAPERS_CHUNKS_MAPPING  — the index mapping (schema + settings)
     HYBRID_RRF_PIPELINE          — the search pipeline that combines BM25 + KNN scores
 
-WHY a separate chunks index (arxiv-papers-chunks) instead of adding vectors to arxiv-papers?
-The existing arxiv-papers index stores ONE document per paper (full_text, title, abstract).
-Hybrid search operates at the CHUNK level — we embed each 600-word passage separately and
-store each as its own document. Mixing chunk documents and paper documents in the same index
-would confuse BM25 (term statistics would be polluted by tiny chunk texts vs. full papers)
-and complicate search (you'd have to filter by document type on every query).
-Keeping them separate is cleaner and lets you tune each index independently.
+HOW HYBRID SEARCH ACTUALLY WORKS — two independent mechanisms, not one:
+
+    BM25 operates ONLY on type=text fields (chunk_text, title, abstract).
+    It tokenizes the query string ("attention mechanism"), looks up which documents
+    contain those tokens, and scores by term frequency. It is completely blind to
+    the embedding field — you cannot do keyword search on a vector.
+
+    KNN operates ONLY on the type=knn_vector field (embedding). It takes the query
+    as a 1024-dim float array from Jina, traverses the HNSW graph, and returns
+    the chunks whose vectors point in the most similar direction. It is completely
+    blind to the text fields.
+
+    They run as TWO SEPARATE sub-queries inside one OpenSearch request:
+
+        hybrid query {
+            sub-query 1: BM25  on chunk_text → ranked list A
+            sub-query 2: KNN   on embedding  → ranked list B
+        }
+        → RRF pipeline merges list A + list B → final ranking
+
+    The embedding field is in the mapping not so BM25 can search it, but so
+    OpenSearch knows to build an HNSW graph for it at index time.
+
+    The two modalities catch DIFFERENT KINDS of relevance:
+      - BM25 finds chunks that contain the exact words "transformer encoder"
+      - KNN finds chunks semantically similar to the query even if they say
+        "sequence-to-sequence attention" instead of "transformer encoder"
+    RRF rewards chunks that rank well in BOTH lists.
+    
 """
 
 ARXIV_PAPERS_CHUNKS_INDEX = "arxiv-papers-chunks"

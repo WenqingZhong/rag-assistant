@@ -7,7 +7,12 @@ from opensearchpy.exceptions import NotFoundError, RequestError
 
 from src.config import get_settings
 from .index_config import INDEX_NAME, INDEX_SETTINGS
-from .query_builder import PaperQueryBuilder
+from .index_config_hybrid import (
+    ARXIV_PAPERS_CHUNKS_INDEX,
+    ARXIV_PAPERS_CHUNKS_MAPPING,
+    HYBRID_RRF_PIPELINE,
+)
+from .query_builder import PaperQueryBuilder, QueryBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +65,12 @@ class OpenSearchClient:
             ssl_assert_hostname=False,
             ssl_show_warn=False,
         )
-        logger.info(f"OpenSearch client initialized: {self.host} (index: {self.index_name})")
+        # Separate index for chunk-level hybrid search (arxiv-papers-chunks).
+        # Kept distinct from self.index_name (arxiv-papers) because chunk documents
+        # and full-paper documents must not share the same BM25 term statistics.
+        self.chunks_index_name = ARXIV_PAPERS_CHUNKS_INDEX
+
+        logger.info(f"OpenSearch client initialized: {self.host} (index: {self.index_name}, chunks: {self.chunks_index_name})")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Index management
@@ -350,3 +360,332 @@ class OpenSearchClient:
         except Exception as e:
             logger.error(f"Error fetching cluster health: {e}")
             return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Hybrid search setup (chunks index + RRF pipeline)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def setup_hybrid_indices(self, force: bool = False) -> Dict[str, bool]:
+        """
+        One-shot setup: create the chunks index and register the RRF pipeline.
+
+        Call this once on application startup (or from an Airflow setup task)
+        before any chunks are indexed. Idempotent when force=False — safe to
+        call repeatedly without losing data.
+
+        :param force: If True, delete and recreate both the index and pipeline.
+                      DESTRUCTIVE — you lose all indexed chunks. Dev-only.
+        :returns: {"hybrid_index": True/False, "rrf_pipeline": True/False}
+                  True = just created, False = already existed.
+        """
+        return {
+            "hybrid_index": self._create_hybrid_index(force),
+            "rrf_pipeline": self._create_rrf_pipeline(force),
+        }
+
+    def _create_hybrid_index(self, force: bool = False) -> bool:
+        """
+        Create the arxiv-papers-chunks KNN index using ARXIV_PAPERS_CHUNKS_MAPPING.
+
+        WHY not reuse create_index()?
+        create_index() is wired to self.index_name (arxiv-papers) and uses
+        INDEX_SETTINGS (the paper mapping). The chunks index lives at
+        self.chunks_index_name and needs a completely different mapping
+        (knn_vector field, chunk_text instead of full_text, etc.).
+
+        :returns: True if created, False if already existed.
+        """
+        try:
+            exists = self.client.indices.exists(index=self.chunks_index_name)
+            if exists:
+                if force:
+                    logger.warning(f"force=True: deleting chunks index '{self.chunks_index_name}'")
+                    self.client.indices.delete(index=self.chunks_index_name)
+                else:
+                    logger.info(f"Chunks index '{self.chunks_index_name}' already exists — skipping")
+                    return False
+
+            self.client.indices.create(index=self.chunks_index_name, body=ARXIV_PAPERS_CHUNKS_MAPPING)
+            logger.info(f"Created chunks index '{self.chunks_index_name}'")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error creating chunks index: {e}")
+            raise
+
+    def _create_rrf_pipeline(self, force: bool = False) -> bool:
+        """
+        Register the RRF search pipeline with OpenSearch.
+
+        Search pipelines are NOT the same as ingest pipelines — they run
+        at query time, not at index time. The opensearch-py client doesn't
+        have a native method for search pipelines, so we use the raw
+        transport.perform_request() to hit the /_search/pipeline/ endpoint.
+
+        Once registered, any search request that passes
+        params={"search_pipeline": "hybrid-rrf-pipeline"} will have its
+        BM25 + KNN result lists merged using RRF automatically.
+
+        :returns: True if created, False if already existed.
+        """
+        pipeline_id = HYBRID_RRF_PIPELINE["id"]
+
+        try:
+            # Check existence via GET — 404 means the pipeline doesn't exist yet.
+            self.client.transport.perform_request("GET", f"/_search/pipeline/{pipeline_id}")
+            if force:
+                self.client.transport.perform_request("DELETE", f"/_search/pipeline/{pipeline_id}")
+                logger.info(f"Deleted RRF pipeline '{pipeline_id}' for recreation")
+            else:
+                logger.info(f"RRF pipeline '{pipeline_id}' already exists — skipping")
+                return False
+        except Exception:
+            pass  # 404 → pipeline doesn't exist yet, proceed to create
+
+        try:
+            pipeline_body = {
+                "description": HYBRID_RRF_PIPELINE["description"],
+                "phase_results_processors": HYBRID_RRF_PIPELINE["phase_results_processors"],
+            }
+            self.client.transport.perform_request(
+                "PUT", f"/_search/pipeline/{pipeline_id}", body=pipeline_body
+            )
+            logger.info(f"Created RRF search pipeline '{pipeline_id}'")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error creating RRF pipeline: {e}")
+            raise
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Chunk indexing
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def bulk_index_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Bulk index chunk documents (each with an embedding vector) into the
+        arxiv-papers-chunks index using OpenSearch's native bulk API.
+
+        Each item in `chunks` must be a dict with two keys:
+            "chunk_data": dict of fields matching the ARXIV_PAPERS_CHUNKS_MAPPING
+            "embedding":  List[float] of length 1024 (Jina v3 output)
+
+        WHY use helpers.bulk() here (unlike bulk_index_papers which loops)?
+        Chunks are produced in large batches — a single 10,000-word paper can
+        generate 15-20 chunks, each with a 1024-float embedding. For 15 papers
+        that's ~200-300 HTTP requests if done one-by-one. helpers.bulk() batches
+        them into a single request body using the bulk NDJSON format, reducing
+        HTTP overhead by ~100x.
+
+        Example input:
+            chunks = [
+                {
+                    "chunk_data": {
+                        "chunk_id": "2301.07041_chunk_0",
+                        "arxiv_id": "2301.07041",
+                        "chunk_text": "We propose a new...",
+                        ...
+                    },
+                    "embedding": [0.12, -0.04, 0.88, ...]  # 1024 floats
+                },
+                ...
+            ]
+
+        :returns: {"success": int, "failed": int}
+        """
+        from opensearchpy import helpers
+
+        actions = []
+        for item in chunks:
+            doc = item["chunk_data"].copy()
+            doc["embedding"] = item["embedding"]
+            actions.append({"_index": self.chunks_index_name, "_source": doc})
+
+        try:
+            success, failed = helpers.bulk(self.client, actions, refresh=True)
+            logger.info(f"Bulk indexed {success} chunks, {len(failed)} failed")
+            return {"success": success, "failed": len(failed)}
+        except Exception as e:
+            logger.error(f"Bulk chunk indexing error: {e}")
+            raise
+
+    def delete_paper_chunks(self, arxiv_id: str) -> int:
+        """
+        Delete all chunks belonging to a paper, identified by arxiv_id.
+
+        Called before re-indexing a paper (e.g. if its PDF was re-parsed)
+        to avoid accumulating stale duplicate chunks.
+
+        delete_by_query runs a term filter on the keyword field arxiv_id —
+        this is an exact match, not a full-text search. All matching chunks
+        are deleted in a single atomic operation. refresh=True makes the
+        deletion visible to subsequent searches immediately.
+
+        :returns: Number of chunks deleted.
+        """
+        try:
+            response = self.client.delete_by_query(
+                index=self.chunks_index_name,
+                body={"query": {"term": {"arxiv_id": arxiv_id}}},
+                refresh=True,
+            )
+            deleted = response.get("deleted", 0)
+            logger.info(f"Deleted {deleted} chunks for paper '{arxiv_id}'")
+            return deleted
+        except Exception as e:
+            logger.error(f"Error deleting chunks for '{arxiv_id}': {e}")
+            return 0
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Unified search (BM25 / hybrid)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def search_unified(
+        self,
+        query: str,
+        query_embedding: Optional[List[float]] = None,
+        size: int = 10,
+        from_: int = 0,
+        categories: Optional[List[str]] = None,
+        use_hybrid: bool = True,
+        min_score: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Main search entry point for the hybrid search endpoint.
+
+        Routing logic:
+            query_embedding provided AND use_hybrid=True  → hybrid (BM25 + KNN + RRF)
+            otherwise                                     → BM25 only on chunks
+
+        WHY expose use_hybrid as a flag?
+        During development or when Jina is unavailable, you can disable vector
+        search and fall back to pure BM25 without changing the call site.
+        The response shape is identical in both modes.
+
+        :param query:           User's text query.
+        :param query_embedding: 1024-dim Jina vector for the query. None → BM25 only.
+        :param size:            Number of results to return.
+        :param from_:           Pagination offset.
+        :param categories:      arXiv category filter (OR logic).
+        :param use_hybrid:      If False, force BM25-only even if embedding is provided.
+        :param min_score:       Drop results below this RRF score (hybrid mode only).
+        :returns: {"total": int, "hits": [{"chunk_text": ..., "score": ..., ...}]}
+        """
+        if query_embedding and use_hybrid:
+            return self._search_hybrid_native(query, query_embedding, size, categories, min_score)
+        return self._search_bm25_chunks(query, size, from_, categories)
+
+    def _search_bm25_chunks(
+        self,
+        query: str,
+        size: int,
+        from_: int,
+        categories: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        """
+        Pure BM25 search on the arxiv-papers-chunks index.
+
+        Uses QueryBuilder(search_chunks=True) which searches chunk_text^3,
+        title^2, abstract^1 and excludes the embedding vector from results.
+        """
+        search_body = QueryBuilder(
+            query=query,
+            size=size,
+            from_=from_,
+            categories=categories,
+            search_chunks=True,
+        ).build()
+
+        try:
+            response = self.client.search(index=self.chunks_index_name, body=search_body)
+            hits = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                doc["chunk_id"] = hit["_id"]
+                if "highlight" in hit:
+                    doc["highlights"] = hit["highlight"]
+                hits.append(doc)
+
+            total = response["hits"]["total"]["value"]
+            logger.info(f"BM25 chunk search '{query[:50]}' → {total} total, {len(hits)} returned")
+            return {"total": total, "hits": hits}
+
+        except Exception as e:
+            logger.error(f"BM25 chunk search error: {e}")
+            return {"total": 0, "hits": []}
+
+    def _search_hybrid_native(
+        self,
+        query: str,
+        query_embedding: List[float],
+        size: int,
+        categories: Optional[List[str]],
+        min_score: float,
+    ) -> Dict[str, Any]:
+        """
+        Native OpenSearch hybrid search: BM25 + KNN merged by RRF pipeline.
+
+        How the query is constructed:
+            1. Build a normal BM25 body via QueryBuilder to get the bool query
+               and highlight/source config (avoids duplicating that logic).
+            2. Extract just the "query" clause from it.
+            3. Wrap it alongside a knn query inside {"hybrid": {"queries": [...]}}.
+            4. Pass search_pipeline param so OpenSearch applies RRF post-processing.
+
+        WHY size * 2 for the candidate pool?
+        Each sub-query (BM25 and KNN) independently retrieves `size * 2` candidates.
+        After RRF merges and re-ranks them, we truncate to `size`. The larger
+        candidate pool gives RRF more material to work with — a document that ranks
+        #12 in BM25 but #1 in KNN can still surface in the top-10 final results.
+        With a pool of only `size`, such documents would be cut before RRF runs.
+        """
+        # Build BM25 body just to borrow its query clause, _source, and highlight
+        bm25_body = QueryBuilder(
+            query=query,
+            size=size * 2,
+            from_=0,
+            categories=categories,
+            search_chunks=True,
+        ).build()
+
+        hybrid_query = {
+            "hybrid": {
+                "queries": [
+                    bm25_body["query"],  # BM25 sub-query
+                    {"knn": {"embedding": {"vector": query_embedding, "k": size * 2}}},  # KNN sub-query
+                ]
+            }
+        }
+
+        search_body = {
+            "size": size,
+            "query": hybrid_query,
+            "_source": bm25_body["_source"],
+            "highlight": bm25_body["highlight"],
+        }
+
+        try:
+            response = self.client.search(
+                index=self.chunks_index_name,
+                body=search_body,
+                params={"search_pipeline": HYBRID_RRF_PIPELINE["id"]},
+            )
+
+            hits = []
+            for hit in response["hits"]["hits"]:
+                if hit["_score"] < min_score:
+                    continue
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                doc["chunk_id"] = hit["_id"]
+                if "highlight" in hit:
+                    doc["highlights"] = hit["highlight"]
+                hits.append(doc)
+
+            logger.info(f"Hybrid search '{query[:50]}' → {len(hits)} results (min_score={min_score})")
+            return {"total": len(hits), "hits": hits}
+
+        except Exception as e:
+            logger.error(f"Hybrid search error: {e}")
+            return {"total": 0, "hits": []}

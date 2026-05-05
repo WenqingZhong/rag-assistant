@@ -8,20 +8,6 @@ class PaperQueryBuilder:
     """
     Translates high-level search intent into an OpenSearch Query DSL dict.
 
-    WHY a builder class instead of building the query dict inline?
-    ─────────────────────────────────────────────────────────────
-    Even a "simple" BM25 search over multiple fields with filters, sorting,
-    and highlighting is 40-60 lines of nested dicts. Inlining that inside
-    every search function mixes two concerns:
-      - WHAT to search for   (the caller's job: query="transformers", size=5)
-      - HOW to express that  (the builder's job: multi_match, bool, filter, ...)
-
-    Separating them means:
-    1. You can unit-test query construction without a live OpenSearch cluster.
-    2. Different callers (API endpoint, Airflow task, notebook) all produce
-       exactly the same query shape for the same parameters.
-    3. Adding a new option (e.g. a date filter) only requires changing one place.
-
     Usage:
         body = PaperQueryBuilder(query="attention", size=5).build()
         response = opensearch_client.search(index=index_name, body=body)
@@ -317,6 +303,130 @@ class PaperQueryBuilder:
             return None
 
         # Empty query (browse mode) → newest first
+        return [{"published_date": {"order": "desc"}}, "_score"]
+
+
+class QueryBuilder:
+    """
+    Unified query builder for both paper-level and chunk-level BM25 search.
+
+    Used by the hybrid search methods in OpenSearchClient. Supports two modes:
+
+        search_chunks=False (default):
+            Searches the arxiv-papers index.
+            Fields: title^3, abstract^2, authors^1
+            _source: returns paper metadata fields (no full_text)
+
+        search_chunks=True:
+            Searches the arxiv-papers-chunks index.
+            Fields: chunk_text^3, title^2, abstract^1
+            _source: excludes the embedding vector (large, not needed in results)
+
+    WHY a second query builder instead of extending PaperQueryBuilder?
+    PaperQueryBuilder is already wired to the existing /search endpoint and
+    has date/source filters that are irrelevant for chunk search. Keeping them
+    separate avoids adding unused parameters and breaking existing behaviour.
+    """
+
+    def __init__(
+        self,
+        query: str,
+        size: int = 10,
+        from_: int = 0,
+        fields: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        track_total_hits: bool = True,
+        latest_papers: bool = False,
+        search_chunks: bool = False,
+    ):
+        self.query = query
+        self.size = size
+        self.from_ = from_
+        self.categories = categories
+        self.track_total_hits = track_total_hits
+        self.latest_papers = latest_papers
+        self.search_chunks = search_chunks
+
+        if fields is None:
+            # chunk_text gets the highest boost — it's the actual content being searched.
+            # title/abstract are duplicated on every chunk for context, so they get
+            # lower boosts to avoid the same chunk dominating just because its paper
+            # title matches the query.
+            self.fields = ["chunk_text^3", "title^2", "abstract^1"] if search_chunks else ["title^3", "abstract^2", "authors^1"]
+        else:
+            self.fields = fields
+
+    def build(self) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "query": self._build_query(),
+            "size": self.size,
+            "from": self.from_,
+            "track_total_hits": self.track_total_hits,
+            "_source": self._build_source(),
+            "highlight": self._build_highlight(),
+        }
+        sort = self._build_sort()
+        if sort:
+            body["sort"] = sort
+        return body
+
+    def _build_query(self) -> Dict[str, Any]:
+        must_clauses = []
+        if self.query.strip():
+            must_clauses.append({
+                "multi_match": {
+                    "query": self.query,
+                    "fields": self.fields,
+                    "type": "best_fields",
+                    "operator": "or",
+                    "fuzziness": "AUTO",
+                    "prefix_length": 2,
+                }
+            })
+
+        filter_clauses = []
+        if self.categories:
+            filter_clauses.append({"terms": {"categories": self.categories}})
+
+        bool_query: Dict[str, Any] = {
+            "must": must_clauses if must_clauses else [{"match_all": {}}]
+        }
+        if filter_clauses:
+            bool_query["filter"] = filter_clauses
+
+        return {"bool": bool_query}
+
+    def _build_source(self) -> Any:
+        if self.search_chunks:
+            # Exclude embedding — it's a 1024-float array that would bloat every result
+            # and is only needed at index time, never in search results.
+            return {"excludes": ["embedding"]}
+        return ["arxiv_id", "title", "authors", "abstract", "categories", "published_date", "pdf_url"]
+
+    def _build_highlight(self) -> Dict[str, Any]:
+        if self.search_chunks:
+            return {
+                "fields": {
+                    "chunk_text": {"fragment_size": 150, "number_of_fragments": 2, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
+                    "title": {"fragment_size": 0, "number_of_fragments": 0, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
+                    "abstract": {"fragment_size": 150, "number_of_fragments": 1, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
+                },
+                "require_field_match": False,
+            }
+        return {
+            "fields": {
+                "title": {"fragment_size": 0, "number_of_fragments": 0},
+                "abstract": {"fragment_size": 150, "number_of_fragments": 3, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
+                "authors": {"fragment_size": 0, "number_of_fragments": 0, "pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
+            },
+            "require_field_match": False,
+        }
+
+    def _build_sort(self) -> Optional[List[Dict[str, Any]]]:
+        if self.latest_papers:
+            return [{"published_date": {"order": "desc"}}, "_score"]
+        if self.query.strip():
+            return None  # relevance order (BM25 score)
         return [{"published_date": {"order": "desc"}}, "_score"]
 
 
