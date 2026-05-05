@@ -691,7 +691,7 @@ class TextChunker:
         """
         Split text into a list of non-whitespace tokens.
 
-        Uses regex r"\S+" rather than str.split() for consistent behaviour
+        Uses regex r"\\S+" rather than str.split() for consistent behaviour
         across different Unicode whitespace characters (non-breaking spaces,
         em-dashes used as separators, etc.).
         """
