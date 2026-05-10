@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from src.config import get_settings
+from src.routers.ask import router as ask_router
 from src.routers.documents import router as documents_router
 from src.routers.hybrid_search import router as hybrid_search_router
 from src.routers.search import router as search_router
@@ -53,6 +54,14 @@ async def lifespan(app: FastAPI):
     app.state.jina_client = jina_client
     logger.info("Jina embeddings client ready")
 
+    # ── Ollama LLM client ─────────────────────────────────────────────────────
+    ollama_client = OllamaClient(
+        base_url=settings.ollama_host,
+        timeout=settings.ollama_timeout,
+    )
+    app.state.ollama_client = ollama_client
+    logger.info("Ollama client ready")
+
     logger.info("RAG Assistant API ready")
     yield
 
@@ -72,6 +81,7 @@ app = FastAPI(
 app.include_router(documents_router)
 app.include_router(search_router)
 app.include_router(hybrid_search_router)
+app.include_router(ask_router)
 
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["Health"])
