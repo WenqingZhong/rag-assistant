@@ -50,6 +50,25 @@ class ChunkingSettings(BaseSettings):
     min_chunk_size: int = 100
 
 
+class LangfuseSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="LANGFUSE__", env_file=".env", extra="ignore")
+    public_key: str = ""
+    secret_key: str = ""
+    host: str = "http://localhost:3000"
+    enabled: bool = True
+    flush_at: int = 15
+    flush_interval: float = 1.0
+    debug: bool = False
+
+
+class RedisSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="REDIS__", env_file=".env", extra="ignore")
+    host: str = "localhost"
+    port: int = 6379
+    password: str = ""
+    ttl_hours: int = 6
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -70,6 +89,8 @@ class Settings(BaseSettings):
     arxiv: ArxivSettings = Field(default_factory=ArxivSettings)
     pdf_parser: PDFParserSettings = Field(default_factory=PDFParserSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
+    langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
 
 def get_settings() -> Settings:
     return Settings()
