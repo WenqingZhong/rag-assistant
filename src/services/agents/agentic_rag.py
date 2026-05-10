@@ -155,40 +155,32 @@ class AgenticRAGService:
         model_to_use = model or self.graph_config.model
         logger.info(f"Agentic RAG — query: '{query[:80]}', model: {model_to_use}")
 
-        # ── Trace (optional) ──────────────────────────────────────────────────
+        # Create a top-level Langfuse trace via the v2 REST API so the request
+        # appears in the dashboard. Per-step spans would require a compatible
+        # LangChain CallbackHandler, which conflicts with our current stack.
         trace = None
-        if self.langfuse_tracer and self.langfuse_tracer.client:
-            try:
-                trace = self.langfuse_tracer.client.start_as_current_span(
-                    name="agentic_rag_request"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to create Langfuse trace: {e}")
-
-        async def _run(active_trace):
-            return await self._execute_graph(query, model_to_use, user_id, active_trace)
+        if self.langfuse_tracer:
+            trace = self.langfuse_tracer.start_trace(
+                name="agentic_rag_request",
+                input_data={"query": query},
+                user_id=user_id,
+                session_id=f"session_{user_id}",
+            )
 
         try:
-            if trace is not None:
-                with trace as trace_obj:
-                    trace_obj.update(
-                        input={"query": query},
-                        user_id=user_id,
-                        session_id=f"session_{user_id}",
-                    )
-                    return await _run(trace_obj)
-            else:
-                return await _run(None)
+            result = await self._execute_graph(query, model_to_use, user_id, trace)
         except Exception as e:
             logger.error(f"Agentic RAG failed: {e}")
             raise
+
+        return result
 
     async def _execute_graph(
         self,
         query: str,
         model_to_use: str,
         user_id: str,
-        trace,
+        trace=None,
     ) -> dict:
         """Invoke the compiled graph and extract structured results."""
         start = time.time()
@@ -226,15 +218,6 @@ class AgenticRAGService:
 
         config = {"thread_id": f"user_{user_id}_{int(start)}"}
 
-        # CallbackHandler auto-traces every LangChain LLM call inside the graph
-        if self.langfuse_tracer and trace:
-            try:
-                handler = self.langfuse_tracer.get_callback_handler()
-                if handler:
-                    config["callbacks"] = [handler]
-            except Exception as e:
-                logger.warning(f"CallbackHandler unavailable: {e}")
-
         result = await self.graph.ainvoke(
             state_input,
             config=config,
@@ -255,7 +238,6 @@ class AgenticRAGService:
                     "retrieval_attempts": result.get("retrieval_attempts", 0),
                     "execution_time": elapsed,
                 })
-                trace.end()
                 self.langfuse_tracer.flush()
             except Exception:
                 pass
@@ -278,6 +260,7 @@ class AgenticRAGService:
                 result.get("guardrail_result").score
                 if result.get("guardrail_result") else None
             ),
+            "trace_id": getattr(trace, "trace_id", None) if trace else None,
         }
 
     # ── Result extraction helpers ─────────────────────────────────────────────

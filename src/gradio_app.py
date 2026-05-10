@@ -110,85 +110,193 @@ def _format(answer: str, sources: list, chunks_used: int, search_mode: str) -> s
     return answer + footer
 
 
+async def agentic_response(query: str) -> tuple[str, str, str]:
+    """
+    Call POST /api/v1/ask-agentic and return (answer, reasoning, sources).
+
+    Returns three strings so Gradio can populate three separate output boxes:
+    - answer: the final LLM answer
+    - reasoning: bullet list of what the agent decided at each node
+    - sources: formatted list of retrieved papers with metadata
+    """
+    if not query.strip():
+        return "Please enter a question.", "", ""
+
+    payload = {"query": query, "top_k": 3, "use_hybrid": True, "model": DEFAULT_MODEL}
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(f"{API_BASE_URL}/ask-agentic", json=payload)
+
+        if response.status_code != 200:
+            return f"Error: API returned status {response.status_code}\n{response.text}", "", ""
+
+        data = response.json()
+
+        answer = data.get("answer", "No answer generated.")
+
+        steps = data.get("reasoning_steps", [])
+        guardrail = data.get("guardrail_score")
+        attempts = data.get("retrieval_attempts", 0)
+        rewritten = data.get("rewritten_query")
+
+        reasoning_parts = [f"- {s}" for s in steps]
+        if guardrail is not None:
+            reasoning_parts.append(f"\n**Guardrail score:** {guardrail}/100")
+        reasoning_parts.append(f"**Retrieval attempts:** {attempts}")
+        if rewritten:
+            reasoning_parts.append(f"**Rewritten query:** {rewritten}")
+        reasoning = "\n".join(reasoning_parts)
+
+        raw_sources = data.get("sources", [])
+        if raw_sources and isinstance(raw_sources[0], dict):
+            source_lines = []
+            for i, s in enumerate(raw_sources[:5], 1):
+                title = s.get("title", "Unknown")
+                arxiv_id = s.get("arxiv_id", "")
+                url = s.get("url", f"https://arxiv.org/abs/{arxiv_id}")
+                score = s.get("relevance_score", 0.0)
+                source_lines.append(f"{i}. [{title}]({url}) — score: {score:.3f}")
+            sources = "\n".join(source_lines) or "No sources returned."
+        elif raw_sources:
+            sources = "\n".join(f"{i}. {s}" for i, s in enumerate(raw_sources[:5], 1))
+        else:
+            sources = "No sources returned."
+
+        return answer, reasoning, sources
+
+    except httpx.RequestError as e:
+        return f"**Connection error:** {e}\n\nMake sure the API is running at `{API_BASE_URL}`.", "", ""
+    except Exception as e:
+        return f"**Unexpected error:** {e}", "", ""
+
+
 def create_interface() -> gr.Blocks:
     with gr.Blocks(title="arXiv RAG Chat", theme=gr.themes.Soft()) as interface:
-        gr.Markdown(
-            """
-            # arXiv Paper Curator — RAG Chat
+        gr.Markdown("# arXiv Paper Curator — RAG Chat")
 
-            Ask questions about machine learning and AI research papers.
-            The system retrieves relevant chunks from indexed papers and generates an answer.
-            """
-        )
+        with gr.Tabs():
 
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label="Your question",
-                    placeholder="What is self-attention?",
-                    lines=2,
-                    max_lines=5,
+            # ── Tab 1: Classic streaming RAG ──────────────────────────────────
+            with gr.TabItem("Streaming RAG"):
+                gr.Markdown("Stream tokens live from `/api/v1/stream` — classic retrieve → generate pipeline.")
+
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        query_input = gr.Textbox(
+                            label="Your question",
+                            placeholder="What is self-attention?",
+                            lines=2,
+                            max_lines=5,
+                        )
+                    with gr.Column(scale=1):
+                        submit_btn = gr.Button("Ask", variant="primary", size="lg")
+
+                with gr.Accordion("Advanced options", open=False):
+                    top_k = gr.Slider(
+                        minimum=1, maximum=10, value=3, step=1,
+                        label="Chunks to retrieve",
+                    )
+                    use_hybrid = gr.Checkbox(value=True, label="Hybrid search (BM25 + vector)")
+                    model_choice = gr.Dropdown(
+                        choices=["llama3.2:1b", "llama3.2:3b", "llama3.1:8b"],
+                        value=DEFAULT_MODEL,
+                        label="Ollama model",
+                    )
+                    categories = gr.Textbox(
+                        label="arXiv categories (optional)",
+                        placeholder="cs.AI, cs.LG",
+                    )
+
+                response_output = gr.Markdown(
+                    value="Ask a question to get started.",
+                    label="Answer",
+                    height=400,
                 )
-            with gr.Column(scale=1):
-                submit_btn = gr.Button("Ask", variant="primary", size="lg")
 
-        with gr.Accordion("Advanced options", open=False):
-            top_k = gr.Slider(
-                minimum=1, maximum=10, value=3, step=1,
-                label="Chunks to retrieve",
-                info="More chunks = more context but slower generation",
-            )
-            use_hybrid = gr.Checkbox(
-                value=True,
-                label="Hybrid search (BM25 + vector)",
-                info="Better recall than keyword-only; falls back to BM25 if Jina is unavailable",
-            )
-            model_choice = gr.Dropdown(
-                choices=["llama3.2:1b", "llama3.2:3b", "llama3.1:8b"],
-                value=DEFAULT_MODEL,
-                label="Ollama model",
-                info="Larger models give better answers but are slower",
-            )
-            categories = gr.Textbox(
-                label="arXiv categories (optional)",
-                placeholder="cs.AI, cs.LG",
-                info="Comma-separated. Leave empty to search all categories.",
-            )
+                gr.Examples(
+                    examples=[
+                        ["What is self-attention?", 3, True, "llama3.2:1b", "cs.AI, cs.LG"],
+                        ["How do convolutional neural networks work?", 5, True, "llama3.2:1b", "cs.CV"],
+                        ["What is reinforcement learning?", 3, True, "llama3.2:1b", "cs.LG, cs.AI"],
+                        ["Explain large language model pre-training", 4, True, "llama3.2:1b", "cs.CL"],
+                    ],
+                    inputs=[query_input, top_k, use_hybrid, model_choice, categories],
+                )
 
-        response_output = gr.Markdown(
-            value="Ask a question to get started.",
-            label="Answer",
-            height=400,
-        )
+                submit_btn.click(
+                    fn=stream_response,
+                    inputs=[query_input, top_k, use_hybrid, model_choice, categories],
+                    outputs=[response_output],
+                )
+                query_input.submit(
+                    fn=stream_response,
+                    inputs=[query_input, top_k, use_hybrid, model_choice, categories],
+                    outputs=[response_output],
+                )
 
-        gr.Examples(
-            examples=[
-                ["What is self-attention?", 3, True, "llama3.2:1b", "cs.AI, cs.LG"],
-                ["How do convolutional neural networks work?", 5, True, "llama3.2:1b", "cs.CV"],
-                ["What is reinforcement learning?", 3, True, "llama3.2:1b", "cs.LG, cs.AI"],
-                ["Explain large language model pre-training", 4, True, "llama3.2:1b", "cs.CL"],
-            ],
-            inputs=[query_input, top_k, use_hybrid, model_choice, categories],
-        )
+            # ── Tab 2: Agentic RAG ────────────────────────────────────────────
+            with gr.TabItem("Agentic RAG"):
+                gr.Markdown(
+                    "Calls `/api/v1/ask-agentic` — the agent decides whether to retrieve, "
+                    "grades document relevance, and rewrites the query if needed."
+                )
 
-        submit_btn.click(
-            fn=stream_response,
-            inputs=[query_input, top_k, use_hybrid, model_choice, categories],
-            outputs=[response_output],
-        )
-        query_input.submit(
-            fn=stream_response,
-            inputs=[query_input, top_k, use_hybrid, model_choice, categories],
-            outputs=[response_output],
-        )
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        agentic_query = gr.Textbox(
+                            label="Your question",
+                            placeholder="What is self-attention?",
+                            lines=2,
+                            max_lines=5,
+                        )
+                    with gr.Column(scale=1):
+                        agentic_btn = gr.Button("Ask Agent", variant="primary", size="lg")
+
+                agentic_answer = gr.Markdown(
+                    value="Ask a question to get started.",
+                    label="Answer",
+                    height=300,
+                )
+
+                with gr.Row():
+                    with gr.Column():
+                        agentic_reasoning = gr.Markdown(
+                            value="",
+                            label="Agent reasoning",
+                            height=150,
+                        )
+                    with gr.Column():
+                        agentic_sources = gr.Markdown(
+                            value="",
+                            label="Sources",
+                            height=150,
+                        )
+
+                gr.Examples(
+                    examples=[
+                        ["What is self-attention in transformers?"],
+                        ["How does BERT work?"],
+                        ["What is 2+2?"],          # should be rejected by guardrail
+                        ["What is a dog?"],         # should be rejected by guardrail
+                    ],
+                    inputs=[agentic_query],
+                )
+
+                agentic_btn.click(
+                    fn=agentic_response,
+                    inputs=[agentic_query],
+                    outputs=[agentic_answer, agentic_reasoning, agentic_sources],
+                )
+                agentic_query.submit(
+                    fn=agentic_response,
+                    inputs=[agentic_query],
+                    outputs=[agentic_answer, agentic_reasoning, agentic_sources],
+                )
 
         gr.Markdown(
-            """
-            ---
-            **API:** `http://localhost:8000` must be running before using this UI.
-
-            **Common categories:** cs.AI · cs.LG · cs.CL · cs.CV · cs.NE · stat.ML
-            """
+            "**API:** `http://localhost:8000` must be running. "
+            "**Categories:** cs.AI · cs.LG · cs.CL · cs.CV · cs.NE · stat.ML"
         )
 
     return interface

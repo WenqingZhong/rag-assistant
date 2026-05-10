@@ -12,14 +12,6 @@ class Context:
     """
     Immutable runtime dependencies injected into every agent node.
 
-    WHY a separate Context instead of closures?
-    LangGraph nodes are plain functions (or coroutines). Passing dependencies
-    via closures would mean re-creating the graph on every request. Instead,
-    we build the graph once and inject a fresh Context at invocation time via
-    LangGraph's `context=` parameter. Nodes access it through Runtime[Context].
-
-    This also makes nodes trivially testable — just construct a Context with
-    mocked clients and invoke the node function directly.
     """
     ollama_client: OllamaClient
     opensearch_client: OpenSearchClient

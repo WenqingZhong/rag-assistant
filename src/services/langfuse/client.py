@@ -64,23 +64,22 @@ class LangfuseTracer:
         """
         Context manager that opens a top-level trace for one RAG request.
 
-        In v3, start_as_current_span() replaces the old client.trace() call.
-        Any spans created inside this context are automatically linked as
-        children — no explicit trace_id passing needed.
+        In Langfuse v2, client.trace() returns a StatefulTraceClient.
+        Child spans are created by calling trace.span() on that object.
         """
         if not self.client:
             yield None
             return
 
         try:
-            with self.client.start_as_current_span(name="rag_request") as span:
-                span.update(
-                    input={"query": query},
-                    user_id=user_id,
-                    session_id=session_id,
-                    metadata=metadata or {},
-                )
-                yield span
+            trace = self.client.trace(
+                name="rag_request",
+                input={"query": query},
+                user_id=user_id,
+                session_id=session_id,
+                metadata=metadata or {},
+            )
+            yield trace
         except Exception as e:
             logger.error(f"Error creating Langfuse trace: {e}")
             yield None
@@ -95,16 +94,15 @@ class LangfuseTracer:
         metadata: Optional[Dict[str, Any]] = None,
     ):
         """
-        Create a named child span inside the current trace context.
+        Create a named child span on an existing trace (Langfuse v2 API).
 
-        The `trace` argument is kept for API compatibility with RAGTracer and
-        the agent nodes, but in v3 it's only used as an "is tracing active?"
-        check — the SDK links the span to the current parent automatically.
+        In v2, spans must be created on the trace object — the root Langfuse
+        client has no .span() method. The trace arg is required (not optional).
         """
         if not self.client or trace is None:
             return None
         try:
-            return self.client.span(
+            return trace.span(
                 name=name,
                 input=input_data,
                 metadata=metadata or {},
@@ -167,34 +165,32 @@ class LangfuseTracer:
 
     # ── Agentic / LangChain integration ───────────────────────────────────────
 
-    def get_callback_handler(
+    def start_trace(
         self,
-        trace_name: Optional[str] = None,
+        name: str,
+        input_data: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        tags: Optional[list] = None,
     ):
         """
-        Return a LangChain CallbackHandler for automatic LLM call tracing.
+        Create a top-level Langfuse trace via the v2 REST API.
 
-        When passed as a LangGraph callback, every LLM invocation inside the
-        graph is recorded as a Langfuse generation span — model name, prompt,
-        output, and token counts — with zero manual instrumentation.
+        Returns the trace object so callers can attach output and spans.
+        Returns None when Langfuse is disabled.
         """
         if not self.client:
             return None
         try:
-            from langfuse.langchain import CallbackHandler
-            return CallbackHandler(
-                trace_name=trace_name,
+            return self.client.trace(
+                name=name,
+                input=input_data or {},
                 user_id=user_id,
                 session_id=session_id,
-                metadata=metadata,
-                tags=tags,
+                metadata=metadata or {},
             )
         except Exception as e:
-            logger.error(f"Error creating CallbackHandler: {e}")
+            logger.warning(f"Failed to create Langfuse trace: {e}")
             return None
 
     def submit_feedback(
