@@ -40,7 +40,7 @@ class ChunkingSettings(BaseSettings):
       focused results (not half a paper).
     - overlap_size=100: ~one short paragraph of overlap. Prevents key sentences
       near chunk boundaries from being split across two chunks with no shared
-      context. Rule: overlap must be < chunk_size.
+      context.
     - min_chunk_size=100: Chunks shorter than this get merged with neighbors.
       A 50-word chunk has too little signal for meaningful embedding.
     """
@@ -63,8 +63,6 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.2:1b"
     ollama_timeout: int = 300
 
-    # Jina AI embeddings API key — required for hybrid search.
-    # Get a free key at https://jina.ai
     # Set via JINA_API_KEY in .env
     jina_api_key: str = ""
 
@@ -72,7 +70,6 @@ class Settings(BaseSettings):
     arxiv: ArxivSettings = Field(default_factory=ArxivSettings)
     pdf_parser: PDFParserSettings = Field(default_factory=PDFParserSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
-
 
 def get_settings() -> Settings:
     return Settings()
