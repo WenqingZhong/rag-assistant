@@ -7,7 +7,13 @@ from .client import LangfuseTracer
 
 class RAGTracer:
     """
-    High-level tracing API for the RAG pipeline.
+    High-level tracing API for the non-agentic RAG pipeline (/ask, /stream).
+
+    Wraps LangfuseTracer with pipeline-specific context managers so route
+    handlers don't need to know about span names or input schemas.
+
+    Each context manager opens a span on entry and closes it on exit via
+    end_span(), capturing wall-clock duration automatically.
 
     USAGE IN A ROUTE:
         rag_tracer = RAGTracer(langfuse_tracer)
@@ -15,7 +21,6 @@ class RAGTracer:
         with rag_tracer.trace_request("user_123", query) as trace:
             with rag_tracer.trace_embedding(trace, query) as span:
                 embedding = await jina.embed_query(query)
-                # span auto-ends when the with block exits
 
             with rag_tracer.trace_search(trace, query, top_k) as span:
                 chunks = opensearch.search_unified(...)
@@ -26,9 +31,6 @@ class RAGTracer:
                 rag_tracer.end_generation(span, answer, model)
 
             rag_tracer.end_request(trace, answer, elapsed)
-
-    Each context manager opens a span on entry and closes it on exit,
-    capturing the wall-clock duration of that step automatically.
     """
 
     def __init__(self, tracer: LangfuseTracer):
@@ -61,9 +63,10 @@ class RAGTracer:
             yield span
         finally:
             duration_ms = round((time.time() - start) * 1000, 2)
-            self.tracer.update_span(span, output={"duration_ms": duration_ms, "success": True})
-            if span:
-                span.end()
+            self.tracer.end_span(
+                span,
+                output={"duration_ms": duration_ms, "success": True},
+            )
 
     @contextmanager
     def trace_search(self, trace, query: str, top_k: int):
@@ -76,11 +79,10 @@ class RAGTracer:
         try:
             yield span
         finally:
-            if span:
-                span.end()
+            self.tracer.end_span(span)
 
     def end_search(self, span, chunks: List[Dict], arxiv_ids: List[str], total_hits: int):
-        """Attach search result metadata to the search span."""
+        """Attach search result metadata to the search span before it closes."""
         self.tracer.update_span(
             span,
             output={
@@ -106,11 +108,10 @@ class RAGTracer:
         try:
             yield span
         finally:
-            if span:
-                span.end()
+            self.tracer.end_span(span)
 
     def end_generation(self, span, response: str, model: str):
-        """Attach the LLM response to the generation span."""
+        """Attach the LLM response to the generation span before it closes."""
         self.tracer.update_span(
             span,
             output={
