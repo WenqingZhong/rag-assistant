@@ -5,13 +5,17 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from src.config import get_settings
+import redis
+
 from src.routers.ask import router as ask_router
 from src.routers.documents import router as documents_router
 from src.routers.hybrid_search import router as hybrid_search_router
 from src.routers.search import router as search_router
 from src.schemas.api.health import HealthResponse, ServiceStatus
+from src.services.cache.client import CacheClient
 from src.services.database import create_tables, get_session
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
+from src.services.langfuse.client import LangfuseTracer
 from src.services.ollama import OllamaClient
 from src.services.opensearch.client import OpenSearchClient
 
@@ -62,12 +66,40 @@ async def lifespan(app: FastAPI):
     app.state.ollama_client = ollama_client
     logger.info("Ollama client ready")
 
+    # ── Langfuse observability ────────────────────────────────────────────────
+    # LangfuseTracer is safe to create even when disabled or unreachable —
+    # it checks credentials in __init__ and sets self.client = None if missing.
+    # All tracing calls silently no-op when self.client is None.
+    langfuse_tracer = LangfuseTracer(settings=settings)
+    app.state.langfuse_tracer = langfuse_tracer
+    logger.info("Langfuse tracer ready")
+
+    # ── Redis cache ───────────────────────────────────────────────────────────
+    # Redis connection is optional — if Redis is down, the cache is simply
+    # skipped and requests proceed normally. We wrap init in try/except so a
+    # missing Redis container doesn't prevent the API from starting.
+    try:
+        redis_client = redis.Redis(
+            host=settings.redis.host,
+            port=settings.redis.port,
+            password=settings.redis.password or None,
+            decode_responses=True,
+        )
+        redis_client.ping()  # fail fast if Redis is unreachable
+        app.state.cache_client = CacheClient(redis_client, settings.redis)
+        logger.info(f"Redis cache ready ({settings.redis.host}:{settings.redis.port})")
+    except Exception as e:
+        logger.warning(f"Redis unavailable — caching disabled: {e}")
+        app.state.cache_client = None
+
     logger.info("RAG Assistant API ready")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     await app.state.jina_client.close()
     logger.info("Jina client connection pool closed")
+    app.state.langfuse_tracer.shutdown()
+    logger.info("Langfuse flushed and shut down")
     logger.info("Shutting down complete")
 
 
