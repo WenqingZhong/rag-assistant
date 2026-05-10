@@ -9,13 +9,6 @@ class RAGTracer:
     """
     High-level tracing API for the RAG pipeline.
 
-    WHY a separate class from LangfuseTracer?
-    LangfuseTracer knows how to talk to the Langfuse SDK — create traces,
-    create spans, update them. RAGTracer knows about OUR pipeline — what the
-    stages are called, what inputs/outputs each stage has. Keeping them separate
-    means if you swap Langfuse for a different observability tool (Datadog,
-    OpenTelemetry), only LangfuseTracer changes. RAGTracer stays the same.
-
     USAGE IN A ROUTE:
         rag_tracer = RAGTracer(langfuse_tracer)
 

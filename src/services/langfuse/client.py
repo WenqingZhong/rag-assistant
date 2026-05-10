@@ -9,14 +9,8 @@ logger = logging.getLogger(__name__)
 
 class LangfuseTracer:
     """
-    Thin wrapper around the Langfuse SDK.
-
-    WHY a wrapper instead of using the Langfuse SDK directly in route handlers?
-    1. If Langfuse is disabled (no API keys) or its server is down, every SDK call
-       would raise an exception and crash the request. The wrapper catches all errors
-       and silently returns None — tracing failures never affect the user.
-    2. All Langfuse SDK calls are in one place. Swapping the SDK version or
-       switching to a different observability tool only requires changing this file.
+    Thin wrapper around the Langfuse SDK to prevent tracing errors from affecting the user experience.
+        If Langfuse is disabled or encounters an error, all methods degrade gracefully to no-ops.
 
     HOW Langfuse works:
     A "trace" is one top-level unit of work — e.g. one RAG request.
