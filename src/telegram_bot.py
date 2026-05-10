@@ -63,7 +63,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "query": query,
                     "top_k": 3,
                     "use_hybrid": True,
-                    "model": "llama3.2:1b",
                 },
             )
 

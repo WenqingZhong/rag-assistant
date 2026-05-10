@@ -20,6 +20,7 @@ from src.services.database import create_tables, get_session
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.langfuse.client import LangfuseTracer
 from src.services.ollama import OllamaClient
+from src.services.openai.client import OpenAIClient
 from src.services.opensearch.client import OpenSearchClient
 
 logger = logging.getLogger(__name__)
@@ -61,13 +62,25 @@ async def lifespan(app: FastAPI):
     app.state.jina_client = jina_client
     logger.info("Jina embeddings client ready")
 
-    # ── Ollama LLM client ─────────────────────────────────────────────────────
-    ollama_client = OllamaClient(
-        base_url=settings.ollama_host,
-        timeout=settings.ollama_timeout,
-    )
-    app.state.ollama_client = ollama_client
-    logger.info("Ollama client ready")
+    # ── LLM client (OpenAI or Ollama) ─────────────────────────────────────────
+    # Both clients expose the same interface (generate_rag_answer,
+    # generate_rag_answer_stream, get_langchain_model) so all routers and the
+    # agentic service work unchanged regardless of which one is active.
+    if settings.openai.enabled and settings.openai.api_key:
+        llm_client = OpenAIClient(
+            api_key=settings.openai.api_key,
+            model=settings.openai.model,
+            temperature=settings.openai.temperature,
+        )
+        app.state.ollama_client = llm_client
+        logger.info(f"OpenAI client ready (model: {settings.openai.model})")
+    else:
+        llm_client = OllamaClient(
+            base_url=settings.ollama_host,
+            timeout=settings.ollama_timeout,
+        )
+        app.state.ollama_client = llm_client
+        logger.info("Ollama client ready")
 
     # ── Langfuse observability ────────────────────────────────────────────────
     # LangfuseTracer is safe to create even when disabled or unreachable —
@@ -83,7 +96,7 @@ async def lifespan(app: FastAPI):
     # compiled graph itself is stateless and shared across all requests.
     agentic_rag_service = AgenticRAGService(
         opensearch_client=hybrid_os_client,
-        ollama_client=ollama_client,
+        ollama_client=llm_client,
         embeddings_client=jina_client,
         langfuse_tracer=langfuse_tracer,
         graph_config=GraphConfig(),
@@ -173,19 +186,25 @@ async def health_check() -> HealthResponse:
         services["opensearch"] = ServiceStatus(status="unhealthy", message=str(e))
         overall = "degraded"
 
-    # Ollama
-    try:
-        ollama = OllamaClient(base_url=settings.ollama_host, timeout=settings.ollama_timeout)
-        ollama_health = await ollama.health_check()
-        services["ollama"] = ServiceStatus(
-            status=ollama_health["status"],
-            message=ollama_health["message"],
+    # LLM provider (OpenAI or Ollama)
+    if settings.openai.enabled and settings.openai.api_key:
+        services["llm"] = ServiceStatus(
+            status="healthy",
+            message=f"OpenAI API (model: {settings.openai.model})",
         )
-        if ollama_health["status"] != "healthy":
+    else:
+        try:
+            ollama = OllamaClient(base_url=settings.ollama_host, timeout=settings.ollama_timeout)
+            ollama_health = await ollama.health_check()
+            services["llm"] = ServiceStatus(
+                status=ollama_health["status"],
+                message=ollama_health["message"],
+            )
+            if ollama_health["status"] != "healthy":
+                overall = "degraded"
+        except Exception as e:
+            services["llm"] = ServiceStatus(status="unhealthy", message=str(e))
             overall = "degraded"
-    except Exception as e:
-        services["ollama"] = ServiceStatus(status="unhealthy", message=str(e))
-        overall = "degraded"
 
     return HealthResponse(
         status=overall,

@@ -69,6 +69,14 @@ class RedisSettings(BaseSettings):
     ttl_hours: int = 6
 
 
+class OpenAISettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OPENAI__", env_file=".env", extra="ignore")
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.0
+    enabled: bool = False
+
+
 class TelegramSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TELEGRAM__", env_file=".env", extra="ignore")
     enabled: bool = False
@@ -99,6 +107,7 @@ class Settings(BaseSettings):
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
+    openai: OpenAISettings = Field(default_factory=OpenAISettings)
 
 def get_settings() -> Settings:
     return Settings()

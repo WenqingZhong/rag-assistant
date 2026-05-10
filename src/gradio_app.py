@@ -5,10 +5,21 @@ from typing import AsyncIterator
 import gradio as gr
 import httpx
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8000/api/v1"
-DEFAULT_MODEL = "llama3.2:1b"
+
+_settings = get_settings()
+if _settings.openai.enabled and _settings.openai.api_key:
+    DEFAULT_MODEL = _settings.openai.model
+    _MODEL_CHOICES = ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
+    _MODEL_LABEL = "OpenAI model"
+else:
+    DEFAULT_MODEL = "llama3.2:1b"
+    _MODEL_CHOICES = ["llama3.2:1b", "llama3.2:3b", "llama3.1:8b"]
+    _MODEL_LABEL = "Ollama model"
 
 
 async def stream_response(
@@ -199,9 +210,9 @@ def create_interface() -> gr.Blocks:
                     )
                     use_hybrid = gr.Checkbox(value=True, label="Hybrid search (BM25 + vector)")
                     model_choice = gr.Dropdown(
-                        choices=["llama3.2:1b", "llama3.2:3b", "llama3.1:8b"],
+                        choices=_MODEL_CHOICES,
                         value=DEFAULT_MODEL,
-                        label="Ollama model",
+                        label=_MODEL_LABEL,
                     )
                     categories = gr.Textbox(
                         label="arXiv categories (optional)",
@@ -216,10 +227,10 @@ def create_interface() -> gr.Blocks:
 
                 gr.Examples(
                     examples=[
-                        ["What is self-attention?", 3, True, "llama3.2:1b", "cs.AI, cs.LG"],
-                        ["How do convolutional neural networks work?", 5, True, "llama3.2:1b", "cs.CV"],
-                        ["What is reinforcement learning?", 3, True, "llama3.2:1b", "cs.LG, cs.AI"],
-                        ["Explain large language model pre-training", 4, True, "llama3.2:1b", "cs.CL"],
+                        ["What is self-attention?", 3, True, DEFAULT_MODEL, "cs.AI, cs.LG"],
+                        ["How do convolutional neural networks work?", 5, True, DEFAULT_MODEL, "cs.CV"],
+                        ["What is reinforcement learning?", 3, True, DEFAULT_MODEL, "cs.LG, cs.AI"],
+                        ["Explain large language model pre-training", 4, True, DEFAULT_MODEL, "cs.CL"],
                     ],
                     inputs=[query_input, top_k, use_hybrid, model_choice, categories],
                 )
