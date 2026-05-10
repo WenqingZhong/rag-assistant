@@ -1,11 +1,16 @@
 import json
 import logging
+import time
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from src.schemas.api.ask import AskRequest, AskResponse
+from src.services.cache.client import CacheClient
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
+from src.services.langfuse.client import LangfuseTracer
+from src.services.langfuse.tracer import RAGTracer
 from src.services.ollama.client import OllamaClient
 from src.services.opensearch.client import OpenSearchClient
 
@@ -28,44 +33,58 @@ def get_ollama_client(request: Request) -> OllamaClient:
     return request.app.state.ollama_client
 
 
-# ── Shared retrieval helper ────────────────────────────────────────────────────
+def get_langfuse_tracer(request: Request) -> LangfuseTracer:
+    return request.app.state.langfuse_tracer
+
+
+def get_cache_client(request: Request) -> Optional[CacheClient]:
+    # Returns None if Redis was unavailable at startup — callers must handle None.
+    return getattr(request.app.state, "cache_client", None)
+
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 
 async def _retrieve_chunks(
     body: AskRequest,
     opensearch_client: OpenSearchClient,
     jina_client: JinaEmbeddingsClient,
+    rag_tracer: RAGTracer,
+    trace,
 ) -> tuple[list, str]:
     """
-    Embed the query (if hybrid) and retrieve top_k chunks from OpenSearch.
+    Embed the query (if hybrid) and retrieve top_k chunks — with tracing.
 
-    Returns (chunks, search_mode).
-
-    WHY embed here instead of inside each route?
-    Both /ask and /stream do the same retrieval step. Putting it in one place
-    means a change to retrieval logic only happens once.
-
-    WHY graceful fallback instead of propagating the Jina error?
-    If Jina is down, BM25 still returns useful results. A 503 error for
-    the whole request is worse than a keyword-only answer.
+    Each sub-step (embedding, search) is wrapped in its own Langfuse span so
+    you can see in the dashboard exactly how long each step took.
+    If Jina fails, falls back to BM25 and records the failure on the span.
     """
     query_embedding = None
     search_mode = "bm25"
 
     if body.use_hybrid:
-        try:
-            query_embedding = await jina_client.embed_query(body.query)
-            search_mode = "hybrid"
-        except Exception as e:
-            logger.warning(f"Jina embedding failed, falling back to BM25: {e}")
+        with rag_tracer.trace_embedding(trace, body.query) as embedding_span:
+            try:
+                query_embedding = await jina_client.embed_query(body.query)
+                search_mode = "hybrid"
+            except Exception as e:
+                logger.warning(f"Jina embedding failed, falling back to BM25: {e}")
+                rag_tracer.tracer.update_span(
+                    embedding_span, output={"success": False, "error": str(e)}
+                )
 
-    raw_results = opensearch_client.search_unified(
-        query=body.query,
-        query_embedding=query_embedding,
-        size=body.top_k,
-        categories=body.categories,
-        use_hybrid=body.use_hybrid,
-    )
-    return raw_results.get("hits", []), search_mode
+    with rag_tracer.trace_search(trace, body.query, body.top_k) as search_span:
+        raw_results = opensearch_client.search_unified(
+            query=body.query,
+            query_embedding=query_embedding,
+            size=body.top_k,
+            categories=body.categories,
+            use_hybrid=body.use_hybrid,
+        )
+        chunks = raw_results.get("hits", [])
+        arxiv_ids = [c.get("arxiv_id", "") for c in chunks]
+        rag_tracer.end_search(search_span, chunks, arxiv_ids, raw_results.get("total", 0))
+
+    return chunks, search_mode
 
 
 def _build_sources(chunks: list) -> list[str]:
@@ -91,55 +110,72 @@ async def ask(
     opensearch_client: OpenSearchClient = Depends(get_opensearch_client),
     jina_client: JinaEmbeddingsClient = Depends(get_jina_client),
     ollama_client: OllamaClient = Depends(get_ollama_client),
+    langfuse_tracer: LangfuseTracer = Depends(get_langfuse_tracer),
+    cache_client: Optional[CacheClient] = Depends(get_cache_client),
 ) -> AskResponse:
     """
     Full RAG pipeline: retrieve chunks → generate answer → return structured response.
 
-    Uses Ollama's structured output (format=schema) so the response is always
-    valid JSON. Waits for the complete answer before returning — use /stream
-    if you want tokens as they arrive.
-
-    Request body:
-        {
-            "query": "What is self-attention?",
-            "top_k": 3,
-            "use_hybrid": true,
-            "model": "llama3.2:1b",
-            "categories": ["cs.AI"]
-        }
-
-    Response:
-        {
-            "query": "What is self-attention?",
-            "answer": "Self-attention is...",
-            "sources": ["https://arxiv.org/pdf/1706.03762.pdf"],
-            "chunks_used": 3,
-            "search_mode": "hybrid"
-        }
+    New in week 6:
+    - Cache check at the start: if the exact same request was made recently,
+      return the stored answer immediately (skips Jina + OpenSearch + Ollama).
+    - Langfuse tracing: each pipeline stage is recorded as a span so you can
+      inspect timing, inputs, and outputs at http://localhost:3000.
+    - Cache store at the end: save the answer for future identical requests.
     """
     if not opensearch_client.health_check():
         raise HTTPException(status_code=503, detail="Search service unavailable")
 
-    chunks, search_mode = await _retrieve_chunks(body, opensearch_client, jina_client)
+    rag_tracer = RAGTracer(langfuse_tracer)
+    start_time = time.time()
 
-    if not chunks:
-        raise HTTPException(status_code=404, detail="No relevant chunks found for this query")
+    with rag_tracer.trace_request("api_user", body.query) as trace:
+        # ── Cache check ───────────────────────────────────────────────────────
+        # O(1) Redis GET — if hit, skip the entire pipeline (~15-20s saved).
+        if cache_client:
+            cached = await cache_client.find_cached_response(body)
+            if cached:
+                logger.info(f"Cache HIT — returning stored answer for: '{body.query[:60]}'")
+                return cached
 
-    logger.info(f"Generating RAG answer for: '{body.query[:60]}' ({len(chunks)} chunks, mode={search_mode})")
+        # ── Retrieve ──────────────────────────────────────────────────────────
+        chunks, search_mode = await _retrieve_chunks(
+            body, opensearch_client, jina_client, rag_tracer, trace
+        )
 
-    rag_result = await ollama_client.generate_rag_answer(
-        query=body.query,
-        chunks=chunks,
-        model=body.model,
-    )
+        if not chunks:
+            raise HTTPException(status_code=404, detail="No relevant chunks found for this query")
 
-    return AskResponse(
-        query=body.query,
-        answer=rag_result["answer"],
-        sources=rag_result.get("sources", []),
-        chunks_used=len(chunks),
-        search_mode=search_mode,
-    )
+        sources = _build_sources(chunks)
+
+        # ── Generate ──────────────────────────────────────────────────────────
+        from src.services.ollama.prompts import RAGPromptBuilder
+        prompt = RAGPromptBuilder().create_rag_prompt(body.query, chunks)
+
+        with rag_tracer.trace_generation(trace, body.model, prompt) as gen_span:
+            rag_result = await ollama_client.generate_rag_answer(
+                query=body.query,
+                chunks=chunks,
+                model=body.model,
+            )
+            answer = rag_result.get("answer", "")
+            rag_tracer.end_generation(gen_span, answer, body.model)
+
+        rag_tracer.end_request(trace, answer, time.time() - start_time)
+
+        response = AskResponse(
+            query=body.query,
+            answer=answer,
+            sources=sources,
+            chunks_used=len(chunks),
+            search_mode=search_mode,
+        )
+
+        # ── Cache store ───────────────────────────────────────────────────────
+        if cache_client:
+            await cache_client.store_response(body, response)
+
+        return response
 
 
 # ── POST /api/v1/stream  (streaming SSE) ──────────────────────────────────────
@@ -150,75 +186,83 @@ async def stream(
     opensearch_client: OpenSearchClient = Depends(get_opensearch_client),
     jina_client: JinaEmbeddingsClient = Depends(get_jina_client),
     ollama_client: OllamaClient = Depends(get_ollama_client),
+    langfuse_tracer: LangfuseTracer = Depends(get_langfuse_tracer),
+    cache_client: Optional[CacheClient] = Depends(get_cache_client),
 ) -> StreamingResponse:
     """
-    Streaming RAG: retrieve chunks → stream tokens from Ollama as Server-Sent Events.
+    Streaming RAG with tracing and caching.
 
-    WHY SSE instead of WebSocket?
-    SSE is one-directional (server → client) and works over plain HTTP/1.1.
-    The browser sends one request and receives a stream of events — no need for
-    the bidirectional channel that WebSocket adds. For token streaming, SSE is
-    simpler and sufficient.
+    Cache HIT path: stream the cached answer word-by-word (so the UI still
+    sees the familiar token-by-token experience) then send the sources event.
 
-    WHAT the browser receives — two types of SSE events:
-
-        1. Token events (one per Ollama token):
-               data: {"response": "Trans", "done": false}
-               data: {"response": "form", "done": false}
-               data: {"response": "ers", "done": false}
-               ...
-               data: {"response": "", "done": true, "total_duration": 14823000000}
-
-           The browser appends each "response" fragment to the displayed text.
-           When "done" is true, token generation is complete.
-
-        2. Sources event (one, after all tokens):
-               data: {"type": "sources", "sources": [...], "chunks_used": 3, "search_mode": "hybrid"}
-
-           The browser uses this to render the source links below the answer.
-
-    WHY a separate sources event instead of embedding sources in the done token?
-    Ollama's final token already has "done": true. Mutating it to add sources
-    would tie our schema to Ollama's internal format. A separate named event
-    keeps the two concerns independent and makes the browser logic simpler.
-
-    SSE format: each event is "data: {json}\\n\\n" (two newlines end the event).
-    The browser's EventSource API parses this automatically.
-
-    Headers:
-        Cache-Control: no-cache        — don't buffer the stream
-        X-Accel-Buffering: no          — disable nginx/proxy buffering
-        Connection: keep-alive         — keep the HTTP connection open
+    Cache MISS path: same as before — stream Ollama tokens live, then store
+    the full assembled answer in Redis after generation completes.
     """
     if not opensearch_client.health_check():
-        # Can't raise HTTPException inside a StreamingResponse generator.
-        # Return a single SSE error event with HTTP 200 so the browser receives it.
         async def error_stream():
             yield f'data: {json.dumps({"error": "Search service unavailable", "done": True})}\n\n'
-
         return StreamingResponse(error_stream(), media_type="text/event-stream")
 
-    chunks, search_mode = await _retrieve_chunks(body, opensearch_client, jina_client)
-    sources = _build_sources(chunks)
-
     async def token_generator():
-        if not chunks:
-            yield f'data: {json.dumps({"error": "No relevant chunks found", "done": True})}\n\n'
-            return
+        rag_tracer = RAGTracer(langfuse_tracer)
+        start_time = time.time()
 
-        logger.info(f"Streaming RAG for: '{body.query[:60]}' ({len(chunks)} chunks, mode={search_mode})")
+        with rag_tracer.trace_request("api_user", body.query) as trace:
+            # ── Cache check ───────────────────────────────────────────────────
+            if cache_client:
+                cached = await cache_client.find_cached_response(body)
+                if cached:
+                    logger.info(f"Cache HIT (stream) for: '{body.query[:60]}'")
+                    # Re-stream cached answer word-by-word so the UI behaves identically
+                    for word in cached.answer.split():
+                        yield f'data: {json.dumps({"response": word + " ", "done": False})}\n\n'
+                    yield f'data: {json.dumps({"response": "", "done": True})}\n\n'
+                    yield f'data: {json.dumps({"type": "sources", "sources": cached.sources, "chunks_used": cached.chunks_used, "search_mode": cached.search_mode})}\n\n'
+                    return
 
-        async for token_dict in ollama_client.generate_rag_answer_stream(
-            query=body.query,
-            chunks=chunks,
-            model=body.model,
-        ):
-            # Each token_dict looks like: {"response": "Trans", "done": False}
-            # or the final:              {"response": "", "done": True, "total_duration": ...}
-            yield f"data: {json.dumps(token_dict)}\n\n"
+            # ── Retrieve ──────────────────────────────────────────────────────
+            chunks, search_mode = await _retrieve_chunks(
+                body, opensearch_client, jina_client, rag_tracer, trace
+            )
+            sources = _build_sources(chunks)
 
-        # After all tokens, send one metadata event with sources and search info.
-        yield f'data: {json.dumps({"type": "sources", "sources": sources, "chunks_used": len(chunks), "search_mode": search_mode})}\n\n'
+            if not chunks:
+                yield f'data: {json.dumps({"error": "No relevant chunks found", "done": True})}\n\n'
+                return
+
+            # ── Stream generation ─────────────────────────────────────────────
+            from src.services.ollama.prompts import RAGPromptBuilder
+            prompt = RAGPromptBuilder().create_rag_prompt(body.query, chunks)
+
+            full_answer = ""
+            with rag_tracer.trace_generation(trace, body.model, prompt) as gen_span:
+                async for token_dict in ollama_client.generate_rag_answer_stream(
+                    query=body.query,
+                    chunks=chunks,
+                    model=body.model,
+                ):
+                    if token_dict.get("response"):
+                        full_answer += token_dict["response"]
+                    yield f"data: {json.dumps(token_dict)}\n\n"
+
+                rag_tracer.end_generation(gen_span, full_answer, body.model)
+
+            yield f'data: {json.dumps({"type": "sources", "sources": sources, "chunks_used": len(chunks), "search_mode": search_mode})}\n\n'
+
+            rag_tracer.end_request(trace, full_answer, time.time() - start_time)
+
+            # ── Cache store ───────────────────────────────────────────────────
+            if cache_client and full_answer:
+                await cache_client.store_response(
+                    body,
+                    AskResponse(
+                        query=body.query,
+                        answer=full_answer,
+                        sources=sources,
+                        chunks_used=len(chunks),
+                        search_mode=search_mode,
+                    ),
+                )
 
     return StreamingResponse(
         token_generator(),
