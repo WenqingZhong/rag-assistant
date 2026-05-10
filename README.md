@@ -20,35 +20,103 @@ A production-grade Retrieval-Augmented Generation system for querying arXiv rese
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          Interfaces                             │
-│   REST API (FastAPI)  │  Gradio UI  │  Telegram Bot             │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-┌──────────────────────────────▼──────────────────────────────────┐
-│                       Agentic RAG (LangGraph)                   │
-│   Guardrail → Retrieve → Grade → [Rewrite →] Generate          │
-└──────┬──────────────────────────────────────────────────────────┘
-       │                                        │
-┌──────▼──────────┐                   ┌─────────▼──────────┐
-│   OpenSearch    │                   │   LLM Backend      │
-│  arxiv-papers   │                   │  Ollama / OpenAI   │
-│  arxiv-papers-  │                   └────────────────────┘
-│    chunks       │
-└──────┬──────────┘
-       │ synced by
-┌──────▼──────────────────────────────────────────────────────────┐
-│                      Airflow Ingestion DAG                      │
-│  setup → fetch arXiv → store PostgreSQL → sync OpenSearch       │
-│       → daily report → cleanup                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              User Interfaces                                 │
+│                                                                              │
+│   Gradio UI (port 7860)   REST API (port 8000)   Telegram Bot (long-poll)   │
+└────────────────────────────────────┬─────────────────────────────────────────┘
+                                     │
+                    ┌────────────────▼────────────────┐
+                    │     FastAPI  (src/main.py)       │
+                    │  /ask  /ask-agentic  /search     │
+                    │  /hybrid-search  /documents      │
+                    └──┬──────────────────────────┬────┘
+                       │                          │
+         ┌─────────────▼──────────────┐  ┌───────▼────────────────────────┐
+         │   Simple RAG               │  │   Agentic RAG (LangGraph)      │
+         │                            │  │                                 │
+         │   embed query (Jina)       │  │   START                        │
+         │       ↓                    │  │     └► guardrail node          │
+         │   hybrid search            │  │           ├► out_of_scope →END  │
+         │   (OpenSearch RRF)         │  │           └► retrieve node     │
+         │       ↓                    │  │                └► tool_retrieve │
+         │   prompt builder           │  │                     └► grade   │
+         │       ↓                    │  │                          ├► rewrite ─┐│
+         │   LLM generate             │  │                          └► generate │ │
+         │       ↓                    │  │                               └► END  │ │
+         │   SSE stream               │  │                          (retry loop)─┘│
+         └─────────┬──────────────────┘  └───────────────┬─────────────────────┘
+                   │                                      │
+                   └──────────────────┬───────────────────┘
+                                      │
+          ┌───────────────────────────▼──────────────────────────┐
+          │                   Service Layer                        │
+          │                                                        │
+          │  ┌─────────────────┐    ┌──────────────────────────┐  │
+          │  │  OpenSearch      │    │   LLM Backend (duck-typed)│  │
+          │  │                 │    │                           │  │
+          │  │  arxiv-papers   │    │  OllamaClient             │  │
+          │  │  (BM25, 1 doc   │    │    OR                     │  │
+          │  │   per paper)    │    │  OpenAIClient             │  │
+          │  │                 │    │  (identical interface,    │  │
+          │  │  arxiv-papers-  │    │   swap via .env flag)     │  │
+          │  │  chunks         │    └──────────────────────────┘  │
+          │  │  (BM25+KNN,     │                                   │
+          │  │  ~15 chunks     │    ┌──────────────────────────┐  │
+          │  │  per paper,     │    │  Jina Embeddings API      │  │
+          │  │  1024-dim vecs) │    │  (retrieval.passage vs    │  │
+          │  └────────┬────────┘    │   retrieval.query tasks)  │  │
+          │           │             └──────────────────────────┘  │
+          │           │ synced by                                  │
+          │  ┌────────▼──────────────────────────┐                │
+          │  │  search_loaders/                   │                │
+          │  │  paper_loader  → full-paper upsert │                │
+          │  │  chunk_loader  → chunk + embed     │                │
+          │  │                  + upsert pipeline │                │
+          │  └────────┬──────────────────────────┘                │
+          │           │ reads from                                  │
+          │  ┌────────▼────────┐   ┌───────────┐  ┌────────────┐ │
+          │  │  PostgreSQL     │   │   Redis    │  │  Langfuse  │ │
+          │  │  (source of     │   │  (response │  │  (request  │ │
+          │  │   truth for     │   │   cache)   │  │   tracing) │ │
+          │  │   all papers)   │   └───────────┘  └────────────┘ │
+          │  └────────▲────────┘                                  │
+          └───────────┼───────────────────────────────────────────┘
+                      │ written by
+┌─────────────────────┴────────────────────────────────────────────────────┐
+│                     Airflow Ingestion DAG (Mon–Fri 06:00 UTC)            │
+│                                                                           │
+│  Task 1: setup_environment   — verify DB + OpenSearch reachable          │
+│      ↓                         (fail fast before wasting compute)        │
+│  Task 2: fetch_daily_papers  — arXiv API → download PDFs → Docling parse │
+│      ↓                         → upsert into PostgreSQL                  │
+│  Task 3: sync_to_opensearch  — read PostgreSQL → bulk upsert OpenSearch  │
+│      ↓                         (re-syncs all docs; upsert = safe to retry)│
+│  Task 4: generate_daily_report — pull XCom stats from tasks 2 & 3       │
+│      ↓                          → structured log (Slack/Datadog-ready)   │
+│  Task 5: cleanup_temp_files  — delete PDFs older than 30 days from /tmp  │
+│                                 (BashOperator: find -mtime +30 -delete)  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Two OpenSearch indices:**
-- `arxiv-papers` — one document per paper, full text, BM25 keyword search
-- `arxiv-papers-chunks` — ~10–20 chunks per paper with Jina embeddings, hybrid (BM25 + KNN) search
+### Data flow
 
-PostgreSQL is the source of truth. OpenSearch is the search layer. If the OpenSearch index is lost it can be rebuilt from PostgreSQL.
+**Ingestion path** (background, scheduled):
+arXiv API → PDFs → Docling parser → PostgreSQL → `paper_loader` (full-paper upsert) + `chunk_loader` (chunk → 1024-dim Jina embedding → OpenSearch)
+
+**Query path** (real-time, per request):
+query → Jina `retrieval.query` embedding → OpenSearch hybrid search (BM25 + KNN merged by RRF) → top-K chunks → LLM prompt → streaming answer
+
+**Why two OpenSearch indices?**
+
+| Index | Documents | Search type | Used by |
+|---|---|---|---|
+| `arxiv-papers` | 1 per paper, full text | BM25 keyword | `/search` endpoint |
+| `arxiv-papers-chunks` | 10–20 per paper, 600-word chunks with 1024-dim embeddings | BM25 + KNN via RRF | `/hybrid-search`, `/ask`, `/ask-agentic` |
+
+A full 10,000-word paper embedded as one vector produces a blurry average of all its topics. 600-word chunks let the search return the exact passage that answers the question. BM25 and KNN use separate term/vector indices — they cannot share statistics across these two fundamentally different document sizes.
+
+**PostgreSQL is the source of truth.** OpenSearch is a derived search index. If lost, it can be fully rebuilt from PostgreSQL without re-fetching from arXiv.
 
 ---
 
@@ -77,40 +145,103 @@ PostgreSQL is the source of truth. OpenSearch is the search layer. If the OpenSe
 
 ```
 src/
-├── routers/                   # FastAPI route handlers
-│   ├── ask.py                 # Simple RAG: retrieve + generate
-│   ├── agentic_ask.py         # Agentic RAG: guardrail + grade + rewrite
-│   ├── search.py              # BM25 keyword search
-│   ├── hybrid_search.py       # Hybrid BM25 + KNN search
-│   └── documents.py           # Document management
+├── main.py                         ← FastAPI app; lifespan manages all client lifecycles
+├── config.py                       ← Pydantic Settings; all config from .env, fully typed
+├── telegram_bot.py                 ← Long-polling Telegram bot → /ask-agentic
+│
+├── routers/                        ← HTTP layer only; no business logic
+│   ├── ask.py                      ← POST /ask (JSON) and /stream (SSE token-by-token)
+│   ├── agentic_ask.py              ← POST /ask-agentic → LangGraph graph
+│   ├── search.py                   ← POST /search → BM25 on full papers
+│   ├── hybrid_search.py            ← POST /hybrid-search → BM25+KNN+RRF on chunks
+│   └── documents.py                ← CRUD /documents
 │
 ├── services/
-│   ├── agents/                # LangGraph agentic pipeline
-│   │   └── nodes/             # Individual graph nodes
-│   ├── ingestion/             # arXiv fetch, PDF download, Docling parsing
-│   ├── search_loaders/        # Write orchestrators: data → OpenSearch
-│   │   ├── paper_loader.py    # PostgreSQL → OpenSearch (full papers)
-│   │   ├── chunk_loader.py    # text → chunks → embeddings → OpenSearch
-│   │   └── text_chunker.py    # Section-aware sliding-window chunking
-│   ├── opensearch/            # Pure OpenSearch I/O layer
-│   │   ├── client.py          # All OpenSearch operations
-│   │   ├── query_builder.py   # Query DSL construction
-│   │   └── index_config*.py   # Index schemas
-│   ├── embeddings/            # Jina API client
-│   ├── ollama/                # Ollama client + prompt builder
-│   ├── openai/                # OpenAI client (same interface as Ollama)
-│   ├── langfuse/              # Tracing client
-│   └── cache/                 # Redis client
+│   │
+│   ├── agents/                     ← LangGraph agentic pipeline
+│   │   ├── agentic_rag.py          ← AgenticRAGService: builds + compiles graph at startup
+│   │   ├── state.py                ← AgentState dict (add_messages: append, not overwrite)
+│   │   ├── context.py              ← Context dataclass: per-request dependency injection
+│   │   ├── config.py               ← GraphConfig: top_k, model, thresholds, max retries
+│   │   ├── models.py               ← GuardrailScoring, GradeDocuments, GradingResult, etc.
+│   │   ├── prompts.py              ← GUARDRAIL_PROMPT, GRADE_DOCUMENTS_PROMPT, REWRITE_PROMPT
+│   │   ├── tools.py                ← create_retriever_tool: LangChain tool → OpenSearch search
+│   │   └── nodes/
+│   │       ├── guardrail_node.py   ← LLM scores query 0-100; routes continue/out_of_scope
+│   │       ├── retrieve_node.py    ← Emits tool_calls; LangGraph ToolNode executes them
+│   │       ├── grade_documents_node.py  ← LLM: are retrieved chunks relevant? yes/no
+│   │       ├── rewrite_query_node.py    ← LLM reformulates query (temp=0.3); retry loop
+│   │       ├── generate_answer_node.py  ← LLM synthesises final answer from context
+│   │       └── out_of_scope_node.py     ← Returns refusal for off-topic queries
+│   │
+│   ├── ingestion/                  ← arXiv → PDF → text → PostgreSQL
+│   │   ├── fetcher.py              ← ArxivFetcher: Atom XML → DocumentMetadata list
+│   │   ├── downloader.py           ← PDFDownloader: cache-aware, exponential backoff retry
+│   │   ├── parser.py               ← PDFParser: Docling ML layout analysis → {full_text, sections}
+│   │   └── orchestrator.py         ← IngestionOrchestrator: fetch→download→parse→upsert
+│   │
+│   ├── search_loaders/             ← Write orchestrators: move data INTO OpenSearch
+│   │   ├── paper_loader.py         ← PostgreSQL → OpenSearch (full papers, BM25 index)
+│   │   │                              sync_all_documents() called by Airflow task 3
+│   │   ├── chunk_loader.py         ← ChunkLoader: text → chunks → Jina embed → OpenSearch
+│   │   │                              process_paper() / process_papers_batch()
+│   │   └── text_chunker.py         ← TextChunker: section-aware chunking with sliding-window
+│   │                                  fallback; 600-word chunks, 100-word overlap
+│   │
+│   ├── opensearch/                 ← Pure OpenSearch I/O (no PostgreSQL, no Jina)
+│   │   ├── client.py               ← OpenSearchClient: create_papers_index, upsert_paper,
+│   │   │                              bulk_upsert_papers, bulk_upsert_chunks,
+│   │   │                              search_papers, search_unified, health_check
+│   │   ├── query_builder.py        ← PaperQueryBuilder (BM25 on papers), QueryBuilder (chunks)
+│   │   │                              multi_match with field boosting (title^3, abstract^2)
+│   │   ├── index_config.py         ← arxiv-papers mapping: text/date/keyword field types
+│   │   └── index_config_hybrid.py  ← arxiv-papers-chunks mapping: knn_vector + RRF pipeline config
+│   │
+│   ├── embeddings/
+│   │   └── jina_client.py          ← JinaEmbeddingsClient: persistent httpx.AsyncClient
+│   │                                  embed_passages (retrieval.passage task)
+│   │                                  embed_query    (retrieval.query task — different vector space)
+│   │
+│   ├── ollama/
+│   │   ├── client.py               ← OllamaClient: generate_rag_answer (structured JSON output)
+│   │   │                              generate_rag_answer_stream (plain text, SSE-compatible)
+│   │   │                              get_langchain_model → ChatOllama
+│   │   └── prompts.py              ← RAGPromptBuilder (system prompt from .txt file)
+│   │                                  ResponseParser (3-level fallback: JSON → regex → plain text)
+│   │
+│   ├── openai/
+│   │   └── client.py               ← OpenAIClient: identical interface to OllamaClient
+│   │                                  get_langchain_model → ChatOpenAI
+│   │                                  swap providers via OPENAI__ENABLED env var; no code changes
+│   │
+│   ├── langfuse/
+│   │   ├── client.py               ← LangfuseTracer: start_trace, create_span, end_span, flush
+│   │   │                              v2 REST API (compatible with self-hosted Langfuse v2.x)
+│   │   └── tracer.py               ← RAGTracer: context manager for simple RAG tracing
+│   │
+│   └── cache/
+│       └── client.py               ← Redis client for response caching
 │
-├── models/                    # SQLAlchemy models
-├── schemas/                   # Pydantic request/response schemas
-└── config.py                  # Settings (pydantic-settings, env-driven)
+├── models/
+│   └── document.py                 ← SQLAlchemy Document ORM → 'documents' table
+│                                      fields: arxiv_id, title, authors, abstract,
+│                                              full_text, sections, pdf_parsed, published_date
+│
+└── schemas/                        ← Pydantic contracts (API validation + serialisation)
+    ├── api/ask.py                   ← AskRequest, AskResponse, AgenticAskResponse
+    ├── api/search.py                ← SearchRequest, HybridSearchRequest, SearchHit
+    ├── api/health.py                ← HealthResponse, ServiceStatus
+    ├── indexing/chunks.py           ← TextChunk, ChunkMetadata (output of TextChunker)
+    └── embeddings/jina.py           ← JinaEmbeddingRequest/Response
 
 airflow/
 └── dags/
-    ├── ingestion_dag.py       # DAG definition (5-task pipeline)
+    ├── ingestion_dag.py             ← DAG definition: 5 tasks, Mon–Fri 06:00 UTC,
+    │                                   max_active_runs=1, retry×2 with 30min delay
     └── ingestion/
-        └── tasks.py           # Task implementations
+        └── tasks.py                 ← Task callables (lazy imports: Docling/Orchestrator
+                                        loaded only at execution time, not DAG parse time)
+                                        XCom: task 2 → task 3, tasks 2+3 → task 4
 ```
 
 ---
