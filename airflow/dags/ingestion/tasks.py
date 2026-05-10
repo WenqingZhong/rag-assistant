@@ -41,7 +41,7 @@ from sqlalchemy import text
 from src.config import get_settings
 from src.services.database import get_session, create_tables
 
-# NOTE: IngestionOrchestrator, OpenSearchClient, and index_all_documents are
+# NOTE: IngestionOrchestrator, OpenSearchClient, and sync_all_documents are
 # intentionally NOT imported here at module level. Importing them triggers
 # Docling's ML model loading which takes 2-4 minutes. Airflow re-parses every
 # DAG file every 30 seconds — a 4-minute import kills the DAG processor.
@@ -121,10 +121,10 @@ def setup_environment() -> dict:
     if os_client.health_check():
         logger.info("✓ OpenSearch connection OK")
 
-        # create_index(force=False) is idempotent — no-op if index exists.
+        # create_papers_index(force=False) is idempotent — no-op if index exists.
         # We call it here so the index is guaranteed to exist before the
-        # indexing task (task 3) tries to write to it.
-        created = os_client.create_index(force=False)
+        # sync task (task 3) tries to write to it.
+        created = os_client.create_papers_index(force=False)
         if created:
             logger.info("✓ OpenSearch index created (first run)")
         else:
@@ -207,9 +207,9 @@ def fetch_daily_papers(**context) -> dict:
     return results
 
 
-# ─── Task 3: index_papers_to_opensearch ──────────────────────────────────────
+# ─── Task 3: sync_papers_to_opensearch ───────────────────────────────────────
 
-def index_papers_to_opensearch(**context) -> dict:
+def sync_papers_to_opensearch(**context) -> dict:
     """
     Index the papers stored by task 2 from PostgreSQL into OpenSearch.
 
@@ -222,11 +222,11 @@ def index_papers_to_opensearch(**context) -> dict:
     FLOW:
     1. Pull fetch results from XCom (to know how many papers to expect)
     2. Health-check OpenSearch (skip gracefully if it's down)
-    3. Call index_all_documents() which reads from PostgreSQL and indexes
+    3. Call sync_all_documents() which reads from PostgreSQL and syncs
     4. Get post-indexing stats from OpenSearch
     5. Push indexing results to XCom for the report task
     """
-    logger.info("=== Task 3/5: index_papers_to_opensearch ===")
+    logger.info("=== Task 3/5: sync_papers_to_opensearch ===")
 
     # XCom pull: read what task 2 (fetch_daily_papers) produced.
     fetch_results = context["task_instance"].xcom_pull(
@@ -264,12 +264,12 @@ def index_papers_to_opensearch(**context) -> dict:
         return result
 
     # Lazy import for the same reason as IngestionOrchestrator above.
-    from src.services.opensearch.indexing_service import index_all_documents
+    from src.services.search_loaders.paper_loader import sync_all_documents
 
-    # index_all_documents() reads ALL successfully-parsed documents from
-    # PostgreSQL and calls OpenSearchClient.bulk_index_papers() on them.
+    # sync_all_documents() reads ALL successfully-parsed documents from
+    # PostgreSQL and calls OpenSearchClient.bulk_upsert_papers() on them.
     # Returns: {"total": int, "indexed": int, "failed": int, "skipped": int}
-    indexing_stats = index_all_documents()
+    indexing_stats = sync_all_documents()
 
     # Fetch post-indexing total for the report (e.g. "4,532 total in index")
     try:
@@ -329,7 +329,7 @@ def generate_daily_report(**context) -> dict:
     )
     index_results = (
         context["task_instance"].xcom_pull(
-            task_ids="index_papers_to_opensearch", key="index_results"
+            task_ids="sync_papers_to_opensearch", key="index_results"
         ) or {}
     )
 

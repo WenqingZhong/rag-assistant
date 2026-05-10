@@ -10,13 +10,13 @@ from .text_chunker import TextChunker
 logger = logging.getLogger(__name__)
 
 
-class HybridIndexingService:
+class ChunkLoader:
     """
     Orchestrates the full pipeline: paper text → chunks → embeddings → OpenSearch.
 
     WHY a separate service class instead of putting this logic in OpenSearchClient?
     OpenSearchClient is responsible for ONE thing: talking to OpenSearch.
-    HybridIndexingService coordinates THREE services (chunker, Jina, OpenSearch)
+    ChunkLoader coordinates THREE services (chunker, Jina, OpenSearch)
     and owns the business logic of the pipeline. Mixing that into OpenSearchClient
     would make it impossible to swap out the chunker or embeddings provider without
     touching OpenSearch code.
@@ -25,12 +25,12 @@ class HybridIndexingService:
     construction time rather than instantiated here. Benefits:
       - Tests can inject a mock Jina client without making real API calls.
       - The caller (main.py / Airflow task) controls the lifecycle of each client.
-      - You can reuse the same OpenSearchClient for both paper indexing and
-        chunk indexing without creating two separate connections.
+      - You can reuse the same OpenSearchClient for both paper loading and
+        chunk loading without creating two separate connections.
 
     WHY async?
     embed_passages() is async (it makes an HTTP call to Jina's API). Any method
-    that awaits it must also be async. index_paper() and index_papers_batch()
+    that awaits it must also be async. process_paper() and process_papers_batch()
     are both async so they can be awaited from FastAPI route handlers or Airflow
     async tasks without blocking the event loop.
     """
@@ -44,11 +44,11 @@ class HybridIndexingService:
         self.chunker = chunker
         self.embeddings_client = embeddings_client
         self.opensearch_client = opensearch_client
-        logger.info("HybridIndexingService initialised")
+        logger.info("ChunkLoader initialised")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def index_paper(self, paper_data: Dict) -> Dict[str, int]:
+    async def process_paper(self, paper_data: Dict) -> Dict[str, int]:
         """
         Run the full 4-step pipeline for one paper.
 
@@ -67,8 +67,8 @@ class HybridIndexingService:
             (title, authors, abstract) onto every chunk document so search
             results can display a useful card without a JOIN.
 
-        Step 4 — Index:
-            OpenSearchClient.bulk_index_chunks() sends all prepared documents
+        Step 4 — Load:
+            OpenSearchClient.bulk_upsert_chunks() sends all prepared documents
             to OpenSearch in a single bulk request.
 
         :param paper_data: Dict from PostgreSQL — must have arxiv_id, title,
@@ -84,7 +84,7 @@ class HybridIndexingService:
         paper_id = str(paper_data.get("id", ""))
 
         if not arxiv_id:
-            logger.error("Cannot index paper: missing arxiv_id")
+            logger.error("Cannot load paper: missing arxiv_id")
             return {"chunks_created": 0, "chunks_indexed": 0, "embeddings_generated": 0, "errors": 1}
 
         try:
@@ -101,7 +101,7 @@ class HybridIndexingService:
             )
 
             if not chunks:
-                logger.warning(f"No chunks produced for paper {arxiv_id} — nothing to index")
+                logger.warning(f"No chunks produced for paper {arxiv_id} — nothing to load")
                 return {"chunks_created": 0, "chunks_indexed": 0, "embeddings_generated": 0, "errors": 0}
 
             logger.info(f"Step 1 complete: {len(chunks)} chunks for {arxiv_id}")
@@ -118,7 +118,7 @@ class HybridIndexingService:
 
             if len(embeddings) != len(chunks):
                 # This should never happen unless Jina drops items from a batch.
-                # Fail the whole paper rather than indexing mis-aligned chunks.
+                # Fail the whole paper rather than loading mis-aligned chunks.
                 logger.error(
                     f"Embedding count mismatch for {arxiv_id}: "
                     f"{len(embeddings)} embeddings for {len(chunks)} chunks"
@@ -138,8 +138,8 @@ class HybridIndexingService:
             published_date = self._normalise_date(paper_data.get("published_date"))
 
             for chunk, embedding in zip(chunks, embeddings):
-                # chunk_id is deterministic: re-indexing the same paper produces
-                # the same IDs, which means bulk_index_chunks acts as an upsert.
+                # chunk_id is deterministic: re-loading the same paper produces
+                # the same IDs, which means bulk_upsert_chunks acts as an upsert.
                 chunk_id = f"{arxiv_id}_chunk_{chunk.metadata.chunk_index}"
 
                 chunk_doc = {
@@ -166,12 +166,12 @@ class HybridIndexingService:
                 }
                 chunks_with_embeddings.append({"chunk_data": chunk_doc, "embedding": embedding})
 
-            # ── Step 4: Index ──────────────────────────────────────────────
-            results = self.opensearch_client.bulk_index_chunks(chunks_with_embeddings)
+            # ── Step 4: Load ───────────────────────────────────────────────
+            results = self.opensearch_client.bulk_upsert_chunks(chunks_with_embeddings)
 
             logger.info(
                 f"Step 4 complete for {arxiv_id}: "
-                f"{results['success']} indexed, {results['failed']} failed"
+                f"{results['success']} loaded, {results['failed']} failed"
             )
             return {
                 "chunks_created": len(chunks),
@@ -181,16 +181,16 @@ class HybridIndexingService:
             }
 
         except Exception as e:
-            logger.error(f"Error indexing paper {arxiv_id}: {e}", exc_info=True)
+            logger.error(f"Error loading paper {arxiv_id}: {e}", exc_info=True)
             return {"chunks_created": 0, "chunks_indexed": 0, "embeddings_generated": 0, "errors": 1}
 
-    async def index_papers_batch(
+    async def process_papers_batch(
         self,
         papers: List[Dict],
         replace_existing: bool = False,
     ) -> Dict[str, int]:
         """
-        Index a list of papers sequentially, aggregating stats.
+        Load a list of papers sequentially, aggregating stats.
 
         WHY sequential, not concurrent?
         Each paper calls Jina's API (rate-limited) and OpenSearch's bulk API.
@@ -200,7 +200,7 @@ class HybridIndexingService:
 
         :param papers:           List of paper dicts from PostgreSQL.
         :param replace_existing: If True, delete existing chunks for each paper
-                                 before re-indexing. Use when re-parsing PDFs.
+                                 before re-loading. Use when re-parsing PDFs.
         :returns: Aggregated stats across all papers.
         """
         totals = {
@@ -219,7 +219,7 @@ class HybridIndexingService:
                 if deleted:
                     logger.info(f"Deleted {deleted} existing chunks for {arxiv_id}")
 
-            stats = await self.index_paper(paper)
+            stats = await self.process_paper(paper)
 
             totals["papers_processed"] += 1
             totals["total_chunks_created"] += stats["chunks_created"]
@@ -229,20 +229,20 @@ class HybridIndexingService:
 
         logger.info(
             f"Batch complete: {totals['papers_processed']} papers, "
-            f"{totals['total_chunks_indexed']}/{totals['total_chunks_created']} chunks indexed"
+            f"{totals['total_chunks_indexed']}/{totals['total_chunks_created']} chunks loaded"
         )
         return totals
 
-    async def reindex_paper(self, arxiv_id: str, paper_data: Dict) -> Dict[str, int]:
+    async def reprocess_paper(self, arxiv_id: str, paper_data: Dict) -> Dict[str, int]:
         """
-        Delete all existing chunks for a paper, then re-index from scratch.
+        Delete all existing chunks for a paper, then re-load from scratch.
 
         Use when the PDF was re-parsed (better text extraction) or when the
         chunking/embedding configuration changed.
         """
         deleted = self.opensearch_client.delete_paper_chunks(arxiv_id)
-        logger.info(f"Deleted {deleted} chunks before reindexing {arxiv_id}")
-        return await self.index_paper(paper_data)
+        logger.info(f"Deleted {deleted} chunks before reloading {arxiv_id}")
+        return await self.process_paper(paper_data)
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

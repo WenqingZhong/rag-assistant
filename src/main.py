@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     # ── OpenSearch (hybrid chunks index) ─────────────────────────────────────
     # A single OpenSearchClient instance handles both the existing arxiv-papers
     # index (via search_papers) and the new arxiv-papers-chunks index (via
-    # bulk_index_chunks / search_unified). Stored under hybrid_opensearch_client
+    # bulk_upsert_chunks / search_unified). Stored under hybrid_opensearch_client
     # so hybrid_search.py's dependency provider can find it without ambiguity.
     hybrid_os_client = OpenSearchClient(host=settings.opensearch.host)
     app.state.hybrid_opensearch_client = hybrid_os_client

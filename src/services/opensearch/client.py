@@ -76,7 +76,7 @@ class OpenSearchClient:
     # Index management
     # ──────────────────────────────────────────────────────────────────────────
 
-    def create_index(self, force: bool = False) -> bool:
+    def create_papers_index(self, force: bool = False) -> bool:
         """
         Create the index with the mapping defined in index_config.py.
 
@@ -126,7 +126,7 @@ class OpenSearchClient:
     # Document indexing
     # ──────────────────────────────────────────────────────────────────────────
 
-    def index_paper(self, paper_data: Dict[str, Any]) -> bool:
+    def upsert_paper(self, paper_data: Dict[str, Any]) -> bool:
         """
         Index (upsert) a single document into OpenSearch.
 
@@ -193,7 +193,7 @@ class OpenSearchClient:
             logger.error(f"Error indexing '{doc_id_str}': {e}")
             return False
 
-    def bulk_index_papers(self, papers: List[Dict[str, Any]]) -> Dict[str, int]:
+    def bulk_upsert_papers(self, papers: List[Dict[str, Any]]) -> Dict[str, int]:
         """
         Index a list of papers, collecting per-document success/failure counts.
 
@@ -212,7 +212,7 @@ class OpenSearchClient:
         results = {"success": 0, "failed": 0}
 
         for paper in papers:
-            if self.index_paper(paper):
+            if self.upsert_paper(paper):
                 results["success"] += 1
             else:
                 results["failed"] += 1
@@ -379,11 +379,11 @@ class OpenSearchClient:
                   True = just created, False = already existed.
         """
         return {
-            "hybrid_index": self._create_hybrid_index(force),
+            "hybrid_index": self._create_chunks_index(force),
             "rrf_pipeline": self._create_rrf_pipeline(force),
         }
 
-    def _create_hybrid_index(self, force: bool = False) -> bool:
+    def _create_chunks_index(self, force: bool = False) -> bool:
         """
         Create the arxiv-papers-chunks KNN index using ARXIV_PAPERS_CHUNKS_MAPPING.
 
@@ -461,7 +461,7 @@ class OpenSearchClient:
     # Chunk indexing
     # ──────────────────────────────────────────────────────────────────────────
 
-    def bulk_index_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+    def bulk_upsert_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
         """
         Bulk index chunk documents (each with an embedding vector) into the
         arxiv-papers-chunks index using OpenSearch's native bulk API.

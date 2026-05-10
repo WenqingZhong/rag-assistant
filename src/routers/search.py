@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from src.config import get_settings
 from src.schemas.api.search import SearchRequest, SearchResponse
 from src.services.opensearch.client import OpenSearchClient
-from src.services.opensearch.indexing_service import search_bm25
+from src.services.search_loaders.paper_loader import search_bm25
 
 logger = logging.getLogger(__name__)
 

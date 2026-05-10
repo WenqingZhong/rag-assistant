@@ -6,7 +6,7 @@ STRUCTURE (5 tasks in sequence):
         ↓
     fetch_daily_papers        ← fetches from arXiv API, stores in PostgreSQL
         ↓
-    index_papers_to_opensearch ← reads from PostgreSQL, writes to OpenSearch
+    sync_papers_to_opensearch ← reads from PostgreSQL, writes to OpenSearch
         ↓
     generate_daily_report      ← aggregates stats from tasks 2 & 3 via XCom
         ↓
@@ -25,7 +25,7 @@ The production pattern splits this further because:
    Renamed to be explicit about what it fetches. Now deliberately does NOT
    index to OpenSearch — that responsibility belongs to task 3 alone.
 
-3. index_papers_to_opensearch (was "index_documents"):
+3. sync_papers_to_opensearch (was "index_documents"):
    Same name, but now it receives fetch stats from task 2 via XCom and can
    skip gracefully if fetch stored nothing. Pushes indexing stats for task 4.
 
@@ -42,7 +42,7 @@ The production pattern splits this further because:
 
 XCOM FLOW:
     fetch_daily_papers  → pushes key="fetch_results"  → pulled by tasks 3 & 4
-    index_papers_to_opensearch → pushes key="index_results" → pulled by task 4
+    sync_papers_to_opensearch → pushes key="index_results" → pulled by task 4
 """
 
 from datetime import datetime, timedelta
@@ -57,7 +57,7 @@ from airflow.operators.python import PythonOperator
 from ingestion.tasks import (
     fetch_daily_papers,
     generate_daily_report,
-    index_papers_to_opensearch,
+    sync_papers_to_opensearch,
     setup_environment,
 )
 
@@ -114,10 +114,10 @@ with DAG(
         # "task_instance", "dag_run", etc.
     )
 
-    # ── Task 3: Index from PostgreSQL to OpenSearch ──────────────────────────
+    # ── Task 3: Sync from PostgreSQL to OpenSearch ───────────────────────────
     index_task = PythonOperator(
-        task_id="index_papers_to_opensearch",
-        python_callable=index_papers_to_opensearch,
+        task_id="sync_papers_to_opensearch",
+        python_callable=sync_papers_to_opensearch,
     )
 
     # ── Task 4: Generate and log the daily report ────────────────────────────

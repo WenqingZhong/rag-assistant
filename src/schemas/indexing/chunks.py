@@ -33,7 +33,7 @@ class TextChunk(BaseModel):
     This is the central data structure in the week 4 pipeline:
         TextChunker.chunk_paper() → List[TextChunk]
         JinaEmbeddingsClient.embed_passages([chunk.text]) → List[List[float]]
-        HybridIndexingService.index_paper() → OpenSearch
+        ChunkLoader.process_paper() → OpenSearch
 
     WHY include arxiv_id and paper_id on every chunk?
     Each chunk gets its own OpenSearch document. When a search returns a chunk,
