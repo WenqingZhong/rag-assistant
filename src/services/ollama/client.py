@@ -306,3 +306,31 @@ class OllamaClient:
         except Exception as e:
             logger.error(f"Error generating streaming RAG answer: {e}")
             raise OllamaException(f"Failed to generate streaming RAG answer: {e}")
+
+    def get_langchain_model(self, model: str, temperature: float = 0.0):
+        """
+        Return a LangChain-compatible ChatOllama instance.
+
+        WHY this method exists:
+        The agent nodes (guardrail, grade_documents, rewrite_query,
+        generate_answer) need to call Ollama with structured output
+        (llm.with_structured_output(SomeModel)) and async invocation
+        (await llm.ainvoke(prompt)). The plain httpx-based generate()
+        method doesn't support either. ChatOllama from langchain-ollama
+        wraps the same Ollama API but exposes the full LangChain interface.
+
+        WHY not store ChatOllama at init time?
+        Each node may request a different temperature (0.0 for grading,
+        0.3 for query rewriting). Creating the object here is cheap —
+        it's just a config object, no HTTP connection is made until invoke.
+
+        :param model: Ollama model name, e.g. "llama3.2:1b"
+        :param temperature: Sampling temperature (0.0 = deterministic)
+        :returns: ChatOllama instance ready for .ainvoke() or .with_structured_output()
+        """
+        from langchain_ollama import ChatOllama
+        return ChatOllama(
+            base_url=self.base_url,
+            model=model,
+            temperature=temperature,
+        )
