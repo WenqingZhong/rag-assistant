@@ -69,6 +69,13 @@ class RedisSettings(BaseSettings):
     ttl_hours: int = 6
 
 
+class TelegramSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM__", env_file=".env", extra="ignore")
+    enabled: bool = False
+    bot_token: str = ""
+    api_base_url: str = "http://localhost:8000/api/v1"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -91,6 +98,7 @@ class Settings(BaseSettings):
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
 def get_settings() -> Settings:
     return Settings()
