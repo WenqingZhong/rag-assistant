@@ -7,10 +7,13 @@ from sqlalchemy import text
 from src.config import get_settings
 import redis
 
+from src.routers.agentic_ask import router as agentic_ask_router
 from src.routers.ask import router as ask_router
 from src.routers.documents import router as documents_router
 from src.routers.hybrid_search import router as hybrid_search_router
 from src.routers.search import router as search_router
+from src.services.agents.agentic_rag import AgenticRAGService
+from src.services.agents.config import GraphConfig
 from src.schemas.api.health import HealthResponse, ServiceStatus
 from src.services.cache.client import CacheClient
 from src.services.database import create_tables, get_session
@@ -74,6 +77,20 @@ async def lifespan(app: FastAPI):
     app.state.langfuse_tracer = langfuse_tracer
     logger.info("Langfuse tracer ready")
 
+    # ── Agentic RAG service ───────────────────────────────────────────────────
+    # The graph is compiled once here (validates edges, builds routing tables).
+    # Each request gets a fresh Context injected at ainvoke() time — the
+    # compiled graph itself is stateless and shared across all requests.
+    agentic_rag_service = AgenticRAGService(
+        opensearch_client=hybrid_os_client,
+        ollama_client=ollama_client,
+        embeddings_client=jina_client,
+        langfuse_tracer=langfuse_tracer,
+        graph_config=GraphConfig(),
+    )
+    app.state.agentic_rag_service = agentic_rag_service
+    logger.info("Agentic RAG service ready")
+
     # ── Redis cache ───────────────────────────────────────────────────────────
     # Redis connection is optional — if Redis is down, the cache is simply
     # skipped and requests proceed normally. We wrap init in try/except so a
@@ -114,6 +131,7 @@ app.include_router(documents_router)
 app.include_router(search_router)
 app.include_router(hybrid_search_router)
 app.include_router(ask_router)
+app.include_router(agentic_ask_router)
 
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["Health"])
