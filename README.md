@@ -23,7 +23,7 @@ A production-grade Retrieval-Augmented Generation system for querying arXiv rese
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                              User Interfaces                                 │
 │                                                                              │
-│   Gradio UI (port 7860)   REST API (port 8000)   Telegram Bot (long-poll)   │
+│   Gradio UI (port 7861)   REST API (port 8000)   Telegram Bot (long-poll)   │
 └────────────────────────────────────┬─────────────────────────────────────────┘
                                      │
                     ┌────────────────▼────────────────┐
@@ -91,6 +91,7 @@ A production-grade Retrieval-Augmented Generation system for querying arXiv rese
 │  Task 2: fetch_daily_papers  — arXiv API → download PDFs → Docling parse │
 │      ↓                         → upsert into PostgreSQL                  │
 │  Task 3: sync_to_opensearch  — read PostgreSQL → bulk upsert OpenSearch  │
+│      ↓                         + chunk → Jina embed → KNN index           │
 │      ↓                         (re-syncs all docs; upsert = safe to retry)│
 │  Task 4: generate_daily_report — pull XCom stats from tasks 2 & 3       │
 │      ↓                          → structured log (Slack/Datadog-ready)   │
@@ -277,6 +278,10 @@ OPENAI__ENABLED=true
 OPENAI__API_KEY=your_openai_key
 OPENAI__MODEL=gpt-4o-mini
 
+# arXiv categories to fetch (JSON list; multiple categories are OR-ed)
+ARXIV__SEARCH_CATEGORIES=["cs.AI","cs.LG","cs.CL"]
+ARXIV__MAX_RESULTS=30
+
 # Optional: Telegram bot
 TELEGRAM__ENABLED=true
 TELEGRAM__BOT_TOKEN=your_bot_token
@@ -289,11 +294,19 @@ LANGFUSE__SECRET_KEY=your_secret_key
 
 ### 2. Start the stack
 
+**Full stack** (includes Ollama, Langfuse, OpenSearch Dashboards):
+
 ```bash
 docker compose up -d
 ```
 
-This starts: API, PostgreSQL, OpenSearch, Airflow, Ollama, Redis, Langfuse, and the OpenSearch Dashboard.
+**Minimal stack** (recommended on machines with less than 8 GB RAM — skips Ollama and Langfuse):
+
+```bash
+docker compose up -d postgres opensearch redis api gradio telegram-bot airflow
+```
+
+> If you skip Ollama, set `OPENAI__ENABLED=true` in `.env` and provide an OpenAI API key.
 
 ### 3. Pull an LLM model (if using Ollama)
 
@@ -369,18 +382,25 @@ Langfuse traces every agentic request: input query, retrieved chunks, grading de
 
 ### Gradio UI
 
+The Gradio UI starts automatically as part of the Docker Compose stack:
+
 ```bash
-python gradio_launcher.py
+docker compose up -d gradio
 ```
 
-Opens a browser UI at [http://localhost:7860](http://localhost:7860).
+Opens a browser UI at [http://localhost:7861](http://localhost:7861). It provides two tabs:
+
+- **Streaming RAG** — streams tokens live from `/api/v1/stream` with configurable top-K, hybrid search toggle, model selection, and arXiv category filter
+- **Agentic RAG** — calls `/api/v1/ask-agentic` and displays the answer, agent reasoning steps, and source papers
+
+> When running on a remote server, replace `localhost` with the server's public IP.
 
 ### Telegram Bot
 
-Set `TELEGRAM__ENABLED=true` and `TELEGRAM__BOT_TOKEN` in `.env`, then:
+Set `TELEGRAM__ENABLED=true` and `TELEGRAM__BOT_TOKEN` in `.env`. The bot starts automatically as part of Docker Compose:
 
 ```bash
-python -m src.telegram_bot
+docker compose up -d telegram-bot
 ```
 
 The bot connects to the `/ask-agentic` endpoint. Anyone with the bot link can use it.
@@ -392,9 +412,26 @@ The bot connects to the `/ask-agentic` endpoint. Anyone with the bot link can us
 The Airflow DAG (`document_ingestion`) runs five tasks in sequence:
 
 1. **setup_environment** — verifies PostgreSQL and OpenSearch are reachable before spending time on fetching
-2. **fetch_daily_papers** — calls the arXiv API, downloads PDFs, parses with Docling, stores in PostgreSQL
-3. **sync_papers_to_opensearch** — reads parsed documents from PostgreSQL, loads them into OpenSearch
+2. **fetch_daily_papers** — calls the arXiv API (all configured `ARXIV__SEARCH_CATEGORIES` with OR), downloads PDFs, parses with Docling, stores in PostgreSQL
+3. **sync_papers_to_opensearch** — reads parsed documents from PostgreSQL; runs two sync paths in sequence:
+   - **Paper loader** — bulk upserts full-text documents into the `arxiv-papers` BM25 index
+   - **Chunk loader** — splits each paper into ~600-word chunks, generates 1024-dim Jina embeddings (`retrieval.passage` task), and upserts into the `arxiv-papers-chunks` KNN index. This is what powers hybrid search and the agentic RAG pipeline.
 4. **generate_daily_report** — logs a structured summary (papers fetched, indexed, failures)
 5. **cleanup_temp_files** — removes PDF files older than 30 days from `/tmp`
 
 Schedule: Monday–Friday at 06:00 UTC. Each task retries twice with a 30-minute delay.
+
+> **Note on Jina rate limits:** The free Jina tier allows 100,000 tokens/minute. The chunk loader adds a short delay between papers to stay within this limit. If you have a paid Jina plan you can reduce `ARXIV__RATE_LIMIT_DELAY` in `.env`.
+
+---
+
+## Cloud Deployment (EC2)
+
+For deploying on AWS EC2, see [EC2_DEPLOYMENT.md](EC2_DEPLOYMENT.md). It covers:
+
+- Instance sizing and storage recommendations
+- Docker installation and swap configuration for memory-constrained instances
+- Building and starting the stack
+- Updating the deployment after local code changes
+- Airflow setup and backfill commands
+- Accessing the Gradio UI and Telegram bot from a remote instance
