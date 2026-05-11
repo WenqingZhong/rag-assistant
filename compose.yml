@@ -29,6 +29,24 @@ services:
     networks:
       - rag-network
 
+  gradio:
+    build: .
+    container_name: rag-gradio
+    command: ["python", "gradio_launcher.py"]
+    ports:
+      - "7861:7861"
+    depends_on:
+      - api
+    env_file:
+      - .env
+    environment:
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - REDIS__HOST=redis
+    networks:
+      - rag-network
+
   postgres:
     image: postgres:16-alpine
     container_name: rag-postgres
