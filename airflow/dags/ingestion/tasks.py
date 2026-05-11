@@ -294,17 +294,18 @@ def sync_papers_to_opensearch(**context) -> dict:
         from src.models.document import Document
 
         settings = get_settings()
-        chunk_loader = ChunkLoader(
-            chunker=TextChunker(),
-            embeddings_client=JinaEmbeddingsClient(api_key=settings.jina_api_key),
-            opensearch_client=OpenSearchClient(),
-        )
-
-        def run_async(coro):
-            # Airflow 3.0 runs its own event loop — asyncio.run() would deadlock.
-            # Running in a fresh thread gives us a clean loop with no conflict.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, coro).result()
+        def process_paper_in_thread(paper_dict):
+            # httpx.AsyncClient is bound to the event loop it was created in.
+            # Creating ChunkLoader inside the thread gives it a fresh event loop,
+            # avoiding "attached to a different loop" errors.
+            async def inner():
+                chunk_loader = ChunkLoader(
+                    chunker=TextChunker(),
+                    embeddings_client=JinaEmbeddingsClient(api_key=settings.jina_api_key),
+                    opensearch_client=OpenSearchClient(),
+                )
+                return await chunk_loader.process_paper(paper_dict)
+            return asyncio.run(inner())
 
         session = get_session()
         try:
@@ -323,7 +324,8 @@ def sync_papers_to_opensearch(**context) -> dict:
                     "authors": doc.authors or [],
                 }
                 try:
-                    run_async(chunk_loader.process_paper(paper_dict))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(process_paper_in_thread, paper_dict).result()
                     chunks_indexed += 1
                 except Exception as exc:
                     logger.warning(f"Chunk indexing failed for {doc.id}: {exc}")
