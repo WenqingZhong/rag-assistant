@@ -32,7 +32,7 @@ services:
   gradio:
     build: .
     container_name: rag-gradio
-    command: ["python", "gradio_launcher.py"]
+    command: ["python", "-c", "from src.gradio_app import main; main()"]
     ports:
       - "7861:7861"
     depends_on:
