@@ -6,8 +6,10 @@ COPY pyproject.toml uv.lock ./
 
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-cache
+
+ENV VIRTUAL_ENV=/app/.venv
+RUN uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --no-cache
 
 COPY src /app/src
 
