@@ -44,6 +44,7 @@ services:
       - OPENSEARCH__HOST=http://opensearch:9200
       - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
       - REDIS__HOST=redis
+      - API_BASE_URL=http://api:8000/api/v1
     networks:
       - rag-network
 
