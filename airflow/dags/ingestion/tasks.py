@@ -286,17 +286,26 @@ def sync_papers_to_opensearch(**context) -> dict:
     chunks_failed = 0
     try:
         import asyncio
+        import concurrent.futures
         from src.services.search_loaders.chunk_loader import ChunkLoader
         from src.services.search_loaders.text_chunker import TextChunker
         from src.services.embeddings.jina_client import JinaEmbeddingsClient
         from src.services.opensearch.client import OpenSearchClient
         from src.models.document import Document
 
+        settings = get_settings()
         chunk_loader = ChunkLoader(
             chunker=TextChunker(),
-            embeddings_client=JinaEmbeddingsClient(),
+            embeddings_client=JinaEmbeddingsClient(api_key=settings.jina_api_key),
             opensearch_client=OpenSearchClient(),
         )
+
+        def run_async(coro):
+            # Airflow 3.0 runs its own event loop — asyncio.run() would deadlock.
+            # Running in a fresh thread gives us a clean loop with no conflict.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, coro).result()
+
         session = get_session()
         try:
             docs = session.query(Document).filter(
@@ -314,7 +323,7 @@ def sync_papers_to_opensearch(**context) -> dict:
                     "authors": doc.authors or [],
                 }
                 try:
-                    asyncio.run(chunk_loader.process_paper(paper_dict))
+                    run_async(chunk_loader.process_paper(paper_dict))
                     chunks_indexed += 1
                 except Exception as exc:
                     logger.warning(f"Chunk indexing failed for {doc.id}: {exc}")
