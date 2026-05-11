@@ -8,9 +8,6 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
 RUN uv sync --frozen --no-dev --no-cache
 
-ENV VIRTUAL_ENV=/app/.venv
-RUN uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --no-cache
-
 COPY src /app/src
 
 FROM python:3.12.8-slim AS final
