@@ -29,6 +29,24 @@ services:
     networks:
       - rag-network
 
+  telegram-bot:
+    build: .
+    container_name: rag-telegram-bot
+    command: ["python", "-c", "from src.telegram_bot import main; main()"]
+    depends_on:
+      - api
+    env_file:
+      - .env
+    environment:
+      - TELEGRAM__API_BASE_URL=http://api:8000/api/v1
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - REDIS__HOST=redis
+    restart: unless-stopped
+    networks:
+      - rag-network
+
   gradio:
     build: .
     container_name: rag-gradio
