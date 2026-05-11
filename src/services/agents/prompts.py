@@ -27,8 +27,17 @@ Retrieved Documents:
 
 User Question: {question}
 
-If the documents contain keywords or semantic meaning related to the question, grade them as relevant.
-Give a binary score 'yes' or 'no' to indicate whether the documents are relevant to the question.
+Grade the documents as relevant if ANY of the following are true:
+- The documents contain keywords or terms related to the question
+- The documents discuss concepts that partially address the question
+- The documents are about the same general topic area as the question
+- The documents provide background or context that would help answer the question
+
+Only grade as NOT relevant if the documents are completely off-topic and share no meaningful connection to the question.
+
+When in doubt, grade as relevant — it is better to include a somewhat related document than to discard useful context.
+
+Give a binary score 'yes' or 'no' to indicate whether the documents are relevant.
 Also provide brief reasoning for your decision.
 
 Respond in JSON format with 'binary_score' (yes/no) and 'reasoning' fields."""
