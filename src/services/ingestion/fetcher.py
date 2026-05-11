@@ -84,10 +84,11 @@ class ArxivFetcher:
         """
         self._rate_limit()
 
-        # Build the query string. 'cat:cs.AI' means "category = AI papers".
+        # Build the query string. Multiple categories are joined with OR.
         # sortBy=submittedDate gets us the newest papers first.
+        cat_query = "+OR+".join(f"cat:{c}" for c in self.settings.search_categories)
         query = (
-            f"search_query=cat:{self.settings.search_category}"
+            f"search_query={cat_query}"
             f"&start=0"
             f"&max_results={self.settings.max_results}"
             f"&sortBy=submittedDate&sortOrder=descending"

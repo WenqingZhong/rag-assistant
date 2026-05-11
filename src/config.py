@@ -16,7 +16,7 @@ class ArxivSettings(BaseSettings):
     pdf_cache_dir: str = "./data/arxiv_pdfs"
     rate_limit_delay: float = 3.0
     timeout_seconds: int = 30
-    search_category: str = "cs.AI"
+    search_categories: list[str] = ["cs.AI"]
     download_max_retries: int = 3
     download_retry_delay_base: float = 5.0
     max_concurrent_downloads: int = 5
