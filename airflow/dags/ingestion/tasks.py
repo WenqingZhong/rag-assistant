@@ -279,17 +279,66 @@ def sync_papers_to_opensearch(**context) -> dict:
         logger.warning(f"Could not fetch index stats after indexing: {exc}")
         total_in_index = "unknown"
 
+    # Chunk indexing: split papers into overlapping chunks, embed with Jina,
+    # and upsert into the arxiv-papers-chunks KNN index for vector search.
+    # This runs after paper sync so both BM25 and KNN indices are populated.
+    chunks_indexed = 0
+    chunks_failed = 0
+    try:
+        import asyncio
+        from src.services.search_loaders.chunk_loader import ChunkLoader
+        from src.services.search_loaders.text_chunker import TextChunker
+        from src.services.embeddings.jina_client import JinaEmbeddingsClient
+        from src.services.opensearch.client import OpenSearchClient
+        from src.models.document import Document
+
+        chunk_loader = ChunkLoader(
+            chunker=TextChunker(),
+            embeddings_client=JinaEmbeddingsClient(),
+            opensearch_client=OpenSearchClient(),
+        )
+        session = get_session()
+        try:
+            docs = session.query(Document).filter(
+                Document.pdf_parsed == "success",
+                Document.full_text.isnot(None),
+            ).all()
+            for doc in docs:
+                paper_dict = {
+                    "arxiv_id": doc.id,
+                    "id": doc.id,
+                    "title": doc.title or "",
+                    "abstract": doc.abstract or "",
+                    "full_text": doc.full_text,
+                    "sections": doc.sections,
+                    "authors": doc.authors or [],
+                }
+                try:
+                    asyncio.run(chunk_loader.process_paper(paper_dict))
+                    chunks_indexed += 1
+                except Exception as exc:
+                    logger.warning(f"Chunk indexing failed for {doc.id}: {exc}")
+                    chunks_failed += 1
+        finally:
+            session.close()
+        logger.info(f"Chunk indexing complete — papers chunked: {chunks_indexed}, failed: {chunks_failed}")
+    except Exception as exc:
+        logger.error(f"Chunk indexing step failed: {exc}")
+
     result = {
         "status": "completed",
         "indexed": indexing_stats["indexed"],
         "failed": indexing_stats.get("failed", 0),
         "skipped": indexing_stats.get("skipped", 0),
         "total_in_index": total_in_index,
+        "chunks_indexed": chunks_indexed,
+        "chunks_failed": chunks_failed,
     }
 
     logger.info(
         f"Indexing complete — indexed: {result['indexed']}, "
-        f"failed: {result['failed']}, total in index: {total_in_index}"
+        f"failed: {result['failed']}, total in index: {total_in_index}, "
+        f"chunks: {chunks_indexed}"
     )
 
     context["task_instance"].xcom_push(key="index_results", value=result)
