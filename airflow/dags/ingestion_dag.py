@@ -135,8 +135,8 @@ with DAG(
     cleanup_task = BashOperator(
         task_id="cleanup_temp_files",
         bash_command="""
-        echo "Cleaning up PDFs older than 30 days from /tmp..."
-        find /tmp -name "*.pdf" -type f -mtime +30 -delete 2>/dev/null || true
+        echo "Cleaning up PDFs older than 30 days from /opt/airflow/data/arxiv_pdfs..."
+        find /opt/airflow/data/arxiv_pdfs -name "*.pdf" -type f -mtime +1 -delete 2>/dev/null || true
         echo "Cleanup complete"
         """,
     )
